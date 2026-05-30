@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Topic presets → arXiv search queries. Categories (cat:cs.CL …) give far
@@ -6,20 +6,90 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 // cross-cutting themes (agents, RAG, reasoning…) that aren't real categories.
 // ──────────────────────────────────────────────────────────────────────────
 const PRESETS = [
-  { label: "LLMs",            query: "cat:cs.CL" },
-  { label: "AI Agents",       query: 'cat:cs.AI AND (all:agent OR all:agentic OR all:"LLM agent")' },
-  { label: "Reasoning",       query: 'all:reasoning AND (all:"chain-of-thought" OR all:"large language model")' },
-  { label: "RAG",             query: 'all:"retrieval-augmented generation" OR all:RAG' },
-  { label: "RLHF / Alignment",query: 'all:RLHF OR all:DPO OR all:"reinforcement learning from human feedback"' },
-  { label: "Multimodal",      query: "cat:cs.CV AND all:multimodal" },
-  { label: "Computer Vision", query: "cat:cs.CV" },
-  { label: "Diffusion",       query: "cat:cs.CV AND all:diffusion" },
-  { label: "Mech Interp",     query: 'all:"mechanistic interpretability"' },
-  { label: "Efficiency / MoE",query: 'all:quantization OR all:"mixture of experts" OR all:MoE' },
-  { label: "Robotics / VLA",  query: "cat:cs.RO AND all:learning" },
-  { label: "AI Safety",       query: 'all:"AI safety" OR all:"AI alignment"' },
-  { label: "Benchmarks",      query: "cat:cs.CL AND all:benchmark" },
-  { label: "Machine Learning",query: "cat:cs.LG" },
+  {
+    label: "LLMs",
+    query: "cat:cs.CL",
+    categories: ["cs.CL"],
+    terms: ["large language model", "language model", "llm", "instruction tuning", "transformer"],
+  },
+  {
+    label: "AI Agents",
+    query: 'cat:cs.AI AND (all:agent OR all:agentic OR all:"LLM agent")',
+    categories: ["cs.AI", "cs.CL"],
+    terms: ["agent", "agentic", "llm agent", "tool use", "multi-agent", "planning", "memory"],
+  },
+  {
+    label: "Reasoning",
+    query: 'all:reasoning AND (all:"chain-of-thought" OR all:"large language model")',
+    categories: ["cs.CL", "cs.AI"],
+    terms: ["reasoning", "chain of thought", "chain-of-thought", "cot", "verifier", "math", "proof"],
+  },
+  {
+    label: "RAG",
+    query: 'all:"retrieval-augmented generation" OR all:RAG',
+    categories: ["cs.CL", "cs.IR"],
+    terms: ["retrieval augmented generation", "rag", "retrieval", "grounding", "knowledge base", "reranking"],
+  },
+  {
+    label: "RLHF / Alignment",
+    query: 'all:RLHF OR all:DPO OR all:"reinforcement learning from human feedback"',
+    categories: ["cs.CL", "cs.AI", "cs.LG"],
+    terms: ["rlhf", "dpo", "preference optimization", "alignment", "human feedback", "reward model"],
+  },
+  {
+    label: "Multimodal",
+    query: "cat:cs.CV AND all:multimodal",
+    categories: ["cs.CV", "cs.CL"],
+    terms: ["multimodal", "vision language", "vlm", "image text", "video language"],
+  },
+  {
+    label: "Computer Vision",
+    query: "cat:cs.CV",
+    categories: ["cs.CV"],
+    terms: ["computer vision", "image", "video", "object detection", "segmentation", "visual recognition"],
+  },
+  {
+    label: "Diffusion",
+    query: "cat:cs.CV AND all:diffusion",
+    categories: ["cs.CV", "cs.LG"],
+    terms: ["diffusion", "denoising", "score matching", "text to image", "image generation"],
+  },
+  {
+    label: "Mech Interp",
+    query: 'all:"mechanistic interpretability"',
+    categories: ["cs.LG", "cs.CL"],
+    terms: ["mechanistic interpretability", "interpretability", "circuit", "activation", "feature attribution", "representation"],
+  },
+  {
+    label: "Efficiency / MoE",
+    query: 'all:quantization OR all:"mixture of experts" OR all:MoE',
+    categories: ["cs.LG", "cs.CL"],
+    terms: ["quantization", "mixture of experts", "moe", "sparsity", "distillation", "inference efficiency"],
+  },
+  {
+    label: "Robotics / VLA",
+    query: "cat:cs.RO AND all:learning",
+    categories: ["cs.RO"],
+    terms: ["robotics", "vision language action", "vla", "embodied ai", "robot learning", "manipulation"],
+  },
+  {
+    label: "AI Safety",
+    query: 'all:"AI safety" OR all:"AI alignment"',
+    categories: ["cs.AI", "cs.CL"],
+    terms: ["ai safety", "alignment", "jailbreak", "red teaming", "robustness", "misuse", "risk"],
+  },
+  {
+    label: "Benchmarks",
+    query: "cat:cs.CL AND all:benchmark",
+    categories: ["cs.CL", "cs.LG"],
+    terms: ["benchmark", "evaluation", "dataset", "leaderboard", "test set", "task suite"],
+  },
+  {
+    label: "Machine Learning",
+    query: "cat:cs.LG",
+    categories: ["cs.LG", "stat.ML"],
+    terms: ["machine learning", "learning algorithm", "generalization", "optimization", "training"],
+  },
 ];
 
 const COUNT_OPTIONS = [10, 20, 30];
@@ -69,7 +139,8 @@ function extractJson(raw) {
   return null;
 }
 
-async function apiCall(prompt, maxTokens = 900) {
+// ── chat-completions call taking a full message array (system/user/assistant) ──
+async function chatCall(messages, maxTokens = 8000) {
   const apiKey = getApiKey();
   if (!apiKey) throw new Error("OpenRouter API key not found. Open Settings to add one, or set REACT_APP_OPENROUTER_API_KEY.");
   const model = getModel();
@@ -83,7 +154,7 @@ async function apiCall(prompt, maxTokens = 900) {
       "HTTP-Referer": "http://localhost",
       "X-Title": APP_NAME,
     },
-    body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
   });
   if (!res.ok) throw new Error(`API status ${res.status}`);
   const data = await res.json();
@@ -92,6 +163,10 @@ async function apiCall(prompt, maxTokens = 900) {
   for (const choice of data.choices || []) if (choice.message?.content) raw += choice.message.content + "\n";
   return raw;
 }
+
+// single-prompt convenience wrapper used by the per-paper summarizer
+const apiCall = (prompt, maxTokens = 8000) =>
+  chatCall([{ role: "user", content: prompt }], maxTokens);
 
 // ── generic fetch with CORS-proxy fallbacks; returns response text ──
 async function fetchWithProxies(url) {
@@ -117,6 +192,239 @@ function normId(url = "") {
   return m ? m[1] : url.toLowerCase().trim();
 }
 
+// ── strip an HTML document down to readable body text ──
+function htmlToText(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    doc.querySelectorAll("script, style, nav, header, footer, .ltx_bibliography, .ltx_page_footer").forEach(el => el.remove());
+    const main = doc.querySelector("article") || doc.querySelector("main") || doc.body;
+    return (main?.textContent || "").replace(/\s+/g, " ").trim();
+  } catch { return ""; }
+}
+
+// ── best-effort full-text fetch for an arXiv paper (HTML render, else ""). ──
+// arXiv serves an HTML version for most recent papers; ar5iv is the fallback.
+const FULLTEXT_LIMIT = 16000;
+async function fetchPaperText(paper) {
+  const id = normId(paper.url);
+  if (!/^\d{4}\.\d{4,5}$/.test(id)) return "";
+  const urls = [
+    `https://arxiv.org/html/${id}`,
+    `https://ar5iv.labs.arxiv.org/html/${id}`,
+  ];
+  for (const u of urls) {
+    const html = await fetchWithProxies(u);
+    if (!html || !/<\/?(article|main|body)/i.test(html)) continue;
+    const text = htmlToText(html);
+    if (text && text.length > 500) return text.slice(0, FULLTEXT_LIMIT);
+  }
+  return "";
+}
+
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "that", "this", "into", "over", "using",
+  "based", "paper", "article", "research", "study", "approach", "method", "methods",
+  "system", "systems", "model", "models", "new", "large", "learning",
+]);
+
+const QUALITY_SIGNALS = [
+  "state of the art",
+  "outperform",
+  "benchmark",
+  "dataset",
+  "open source",
+  "open weight",
+  "scalable",
+  "efficient",
+  "evaluation",
+  "framework",
+  "generalization",
+  "theory",
+];
+
+function normalizeForMatch(value = "") {
+  return String(value)
+    .toLowerCase()
+    .replace(/['"`]/g, "")
+    .replace(/[^a-z0-9+#.]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniqNormalized(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const raw = String(value || "").trim();
+    const key = normalizeForMatch(raw);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(raw.toLowerCase());
+  }
+  return out;
+}
+
+function topicTokens(value = "") {
+  return normalizeForMatch(value)
+    .split(" ")
+    .filter(t => t.length >= 3 && !STOPWORDS.has(t));
+}
+
+function getCustomTopicParts(customTopic = "") {
+  const raw = customTopic.trim();
+  if (!raw) return { phrases: [], tokens: [] };
+  const chunks = raw.split(/[;,]/).map(part => part.trim()).filter(Boolean);
+  const phraseSeeds = chunks.length > 1 ? chunks : [raw];
+  return {
+    phrases: uniqNormalized(phraseSeeds).filter(p => normalizeForMatch(p).length >= 3),
+    tokens: uniqNormalized(topicTokens(raw)),
+  };
+}
+
+function quoteArxivPhrase(value = "") {
+  return String(value).trim().replace(/"/g, "");
+}
+
+function buildCustomQuery(customTopic = "") {
+  const { phrases, tokens } = getCustomTopicParts(customTopic);
+  const phraseQueries = phrases
+    .filter(p => normalizeForMatch(p).includes(" "))
+    .slice(0, 4)
+    .map(p => `all:"${quoteArxivPhrase(p)}"`);
+  const tokenQueries = tokens.slice(0, 6).map(t => `all:${t}`);
+  const parts = [...new Set([...phraseQueries, ...tokenQueries])];
+  if (parts.length === 0) return "";
+  return parts.length === 1 ? parts[0] : `(${parts.join(" OR ")})`;
+}
+
+function buildTopicProfile(selectedLabels, customTopic) {
+  const presets = selectedLabels
+    .map(label => PRESETS.find(p => p.label === label))
+    .filter(Boolean);
+  const custom = getCustomTopicParts(customTopic);
+  const presetTerms = presets.flatMap(p => p.terms || []);
+  const labelTokens = presets.flatMap(p => topicTokens(p.label));
+  const phrases = uniqNormalized([
+    ...presetTerms.filter(t => normalizeForMatch(t).includes(" ")),
+    ...custom.phrases.filter(t => normalizeForMatch(t).includes(" ")),
+  ]);
+  const tokens = uniqNormalized([
+    ...presetTerms.flatMap(topicTokens),
+    ...labelTokens,
+    ...custom.tokens,
+  ]);
+  const categories = uniqNormalized(presets.flatMap(p => p.categories || []));
+  return { phrases, tokens, categories };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function tokenVariants(token) {
+  const variants = [token];
+  if (token.endsWith("ies") && token.length > 4) {
+    variants.push(`${token.slice(0, -3)}y`);
+  } else if (token.endsWith("s") && token.length > 4 && !token.endsWith("ss") && !token.endsWith("is")) {
+    variants.push(token.slice(0, -1));
+  } else if (token.length > 2) {
+    variants.push(`${token}s`);
+  }
+  return variants;
+}
+
+function hasMatch(haystack, value) {
+  const needle = normalizeForMatch(value);
+  if (!needle) return false;
+  if (needle.includes(" ")) return haystack.includes(needle);
+  return tokenVariants(needle).some(token =>
+    new RegExp(`(^|\\s)${escapeRegExp(token)}(?=\\s|$)`).test(haystack)
+  );
+}
+
+function recencyScore(date) {
+  if (!date) return 0;
+  const ts = new Date(`${date}T00:00:00Z`).getTime();
+  if (!Number.isFinite(ts)) return 0;
+  const days = Math.max(0, (Date.now() - ts) / 86400000);
+  if (days <= 7) return 5;
+  if (days <= 30) return 3;
+  if (days <= 90) return 1.5;
+  return 0;
+}
+
+function scorePaperForTopic(paper, profile) {
+  const title = normalizeForMatch(paper.title);
+  const abstract = normalizeForMatch(paper.abstract);
+  const combined = `${title} ${abstract}`;
+  const paperCategories = (paper.categories || []).map(c => String(c).toLowerCase());
+  const hasTopicProfile = profile.phrases.length > 0 || profile.tokens.length > 0 || profile.categories.length > 0;
+
+  let topical = 0;
+  let categoryMatches = 0;
+  for (const category of profile.categories) {
+    if (paperCategories.includes(category)) categoryMatches++;
+  }
+  topical += Math.min(14, categoryMatches * 8);
+
+  let phraseMatches = 0;
+  for (const phrase of profile.phrases) {
+    if (hasMatch(title, phrase)) {
+      topical += 18;
+      phraseMatches++;
+    } else if (hasMatch(abstract, phrase)) {
+      topical += 8;
+      phraseMatches++;
+    }
+  }
+
+  let tokenScore = 0;
+  let tokenMatches = 0;
+  for (const token of profile.tokens) {
+    if (hasMatch(title, token)) {
+      tokenScore += 5;
+      tokenMatches++;
+    } else if (hasMatch(abstract, token)) {
+      tokenScore += 2;
+      tokenMatches++;
+    }
+  }
+  topical += Math.min(32, tokenScore);
+  if (profile.tokens.length > 0) {
+    topical += Math.min(12, (tokenMatches / Math.min(profile.tokens.length, 8)) * 12);
+  }
+
+  const topicalHits = categoryMatches + phraseMatches + tokenMatches;
+  let quality = recencyScore(paper.date);
+  quality += paper.source === "hf" ? 1 : 0;
+  quality += Math.min(8, Math.log2((paper.upvotes || 0) + 1) * 1.8);
+  quality += Math.min(4, QUALITY_SIGNALS.filter(signal => hasMatch(combined, signal)).length);
+
+  if (hasTopicProfile && topicalHits === 0) quality -= 20;
+  return Math.round((topical + quality) * 10) / 10;
+}
+
+function comparePaperFallback(a, b) {
+  return (b.upvotes || 0) - (a.upvotes || 0)
+    || (b.date || "").localeCompare(a.date || "")
+    || (a.title || "").localeCompare(b.title || "");
+}
+
+function rankPapersForTopic(papers, profile) {
+  return papers
+    .map(p => ({ ...p, relevanceScore: scorePaperForTopic(p, profile) }))
+    .sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0) || comparePaperFallback(a, b));
+}
+
+function finalPaperScore(paper) {
+  const impact = Math.max(1, Math.min(5, paper.impact || 3));
+  return (paper.relevanceScore || 0) + impact * 7 - (paper.abstractFallback ? 3 : 0);
+}
+
+function sortFinalPapers(papers) {
+  return [...papers].sort((a, b) => finalPaperScore(b) - finalPaperScore(a) || comparePaperFallback(a, b));
+}
+
 // ── arXiv ──
 function parseArxivXml(xml) {
   const doc = new DOMParser().parseFromString(xml, "application/xml");
@@ -132,12 +440,16 @@ function parseArxivXml(xml) {
     const published = get("published");
     const links = Array.from(e.getElementsByTagName("link"));
     const absLink = links.find(l => l.getAttribute("rel") === "alternate");
+    const categories = Array.from(e.getElementsByTagName("category"))
+      .map(c => c.getAttribute("term"))
+      .filter(Boolean);
     return {
       title: get("title"),
       authors: authorStr,
       date: published ? published.slice(0, 10) : "",
       url: absLink ? absLink.getAttribute("href") : get("id"),
       abstract: get("summary"),
+      categories,
       source: "arxiv",
     };
   }).filter(p => p.title && p.abstract);
@@ -165,12 +477,16 @@ async function fetchHFDaily(count) {
     const authors = (p.authors || []).map(a => a.name).filter(Boolean);
     const authorStr = authors.length > 2 ? `${authors[0]} et al.` : authors.join(", ") || "—";
     const id = p.id || "";
+    const categories = (p.categories || p.tags || [])
+      .map(c => typeof c === "string" ? c : (c.term || c.name || c.label))
+      .filter(Boolean);
     return {
       title: (p.title || "").trim().replace(/\s+/g, " "),
       authors: authorStr,
       date: (it.publishedAt || p.publishedAt || "").slice(0, 10),
       url: id ? `https://arxiv.org/abs/${id}` : (p.url || ""),
       abstract: (p.summary || "").trim().replace(/\s+/g, " "),
+      categories,
       source: "hf",
       upvotes: p.upvotes ?? it.upvotes ?? 0,
     };
@@ -266,7 +582,7 @@ function ImpactDots({ n = 3 }) {
   );
 }
 
-function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
+function PaperCard({ paper, index, saved, onToggleSave, onTagClick, onChat }) {
   const [open, setOpen] = useState(false);
   const toggleOpen = () => setOpen(o => !o);
   const onCardKeyDown = (event) => {
@@ -307,6 +623,13 @@ function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
         </div>
         <button
           type="button"
+          className="chat-btn"
+          title="Chat with this paper"
+          aria-label={`Chat about ${paper.title}`}
+          onClick={e => { e.stopPropagation(); onChat(paper); }}
+        >💬</button>
+        <button
+          type="button"
           className={`save-btn ${saved ? "on" : ""}`}
           title={saved ? "Remove bookmark" : "Bookmark"}
           aria-label={saved ? `Remove bookmark for ${paper.title}` : `Bookmark ${paper.title}`}
@@ -341,12 +664,159 @@ function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
             <div className="field"><span className="field-label">Abstract</span>
               <span className="field-val">{paper.abstract}</span></div>
           )}
-          {paper.url && (
-            <a className="card-link" href={paper.url} target="_blank" rel="noreferrer">↗ Open paper</a>
-          )}
+          <div className="card-actions">
+            <button type="button" className="chat-cta" onClick={() => onChat(paper)}>
+              💬 Chat with this paper
+            </button>
+            {paper.url && (
+              <a className="card-link" href={paper.url} target="_blank" rel="noreferrer">↗ Open paper</a>
+            )}
+          </div>
         </div>
       )}
     </article>
+  );
+}
+
+// ── assemble everything we know about a paper into chat-grounding context ──
+function buildPaperContext(paper, fullText) {
+  return [
+    `Title: ${paper.title}`,
+    `Authors: ${paper.authors}`,
+    paper.date && `Published: ${paper.date}`,
+    paper.categories?.length && `Categories: ${paper.categories.join(", ")}`,
+    `Abstract: ${paper.abstract}`,
+    paper.tldr && `TL;DR: ${paper.tldr}`,
+    paper.key_points?.length && `Key points:\n- ${paper.key_points.join("\n- ")}`,
+    paper.method && `Method: ${paper.method}`,
+    paper.results && `Results: ${paper.results}`,
+    fullText && `Full text (may be truncated):\n${fullText}`,
+  ].filter(Boolean).join("\n\n");
+}
+
+const CHAT_SUGGESTIONS = [
+  "Explain this paper like I'm new to the field",
+  "What is the key contribution?",
+  "Walk me through the method step by step",
+  "What are the limitations or weaknesses?",
+  "How does this compare to prior work?",
+];
+
+function ChatModal({ paper, onClose }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [fullText, setFullText] = useState("");
+  const [reading, setReading] = useState(true);
+  const bodyRef = useRef(null);
+  const inputRef = useRef(null);
+
+  // close on Escape
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // ingest the paper's full text once; abstract + summary are the fallback context
+  useEffect(() => {
+    let cancelled = false;
+    setReading(true);
+    fetchPaperText(paper).then(text => {
+      if (!cancelled) { setFullText(text); setReading(false); }
+    });
+    inputRef.current?.focus();
+    return () => { cancelled = true; };
+  }, [paper]);
+
+  // autoscroll to the newest message
+  useEffect(() => {
+    bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, sending]);
+
+  const systemPrompt = useMemo(() => (
+    "You are a knowledgeable research assistant helping a reader understand ONE specific arXiv paper through conversation. " +
+    "Answer questions accurately and ground every claim in the paper content below. " +
+    "If something isn't covered by the provided content, say so plainly instead of guessing. " +
+    "Prefer clear, plain language and concrete examples; keep answers focused.\n\n" +
+    `=== PAPER CONTENT ===\n${buildPaperContext(paper, fullText)}`
+  ), [paper, fullText]);
+
+  const send = useCallback(async (text) => {
+    const content = (text ?? input).trim();
+    if (!content || sending) return;
+    const next = [...messages, { role: "user", content }];
+    setMessages(next);
+    setInput("");
+    setSending(true);
+    try {
+      const reply = await chatCall([{ role: "system", content: systemPrompt }, ...next], 900);
+      setMessages(m => [...m, { role: "assistant", content: reply.trim() || "(no response)" }]);
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant", content: "⚠️ " + (e.message || "Failed to get a response.") }]);
+    } finally {
+      setSending(false);
+    }
+  }, [input, sending, messages, systemPrompt]);
+
+  return (
+    <div
+      className="chat-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Chat about ${paper.title}`}
+      onClick={onClose}
+    >
+      <div className="chat-modal" onClick={e => e.stopPropagation()}>
+        <header className="chat-head">
+          <div className="chat-head-main">
+            <div className="chat-kicker">Chat with paper</div>
+            <div className="chat-title">{paper.title}</div>
+            <div className="chat-status">
+              {reading
+                ? <><span className="mini-spin" aria-hidden="true" /> Reading the paper…</>
+                : fullText ? "Full text loaded — ask anything" : "Using abstract + summary as context"}
+            </div>
+          </div>
+          <button type="button" className="chat-close" aria-label="Close chat" onClick={onClose}>✕</button>
+        </header>
+
+        <div className="chat-body" ref={bodyRef}>
+          {messages.length === 0 && (
+            <div className="chat-intro">
+              <p className="chat-intro-lead">Ask anything about this paper. Try one of these:</p>
+              <div className="chat-suggest">
+                {CHAT_SUGGESTIONS.map(s => (
+                  <button key={s} type="button" disabled={sending} onClick={() => send(s)}>{s}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={i} className={`chat-msg ${m.role}`}>
+              <div className="chat-bubble">{m.content}</div>
+            </div>
+          ))}
+          {sending && (
+            <div className="chat-msg assistant">
+              <div className="chat-bubble typing"><span /><span /><span /></div>
+            </div>
+          )}
+        </div>
+
+        <form className="chat-input-row" onSubmit={e => { e.preventDefault(); send(); }}>
+          <input
+            ref={inputRef}
+            className="chat-input"
+            placeholder="Ask about the method, results, limitations…"
+            value={input}
+            disabled={sending}
+            onChange={e => setInput(e.target.value)}
+          />
+          <button type="submit" className="chat-send" disabled={sending || !input.trim()}>Send</button>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -374,6 +844,7 @@ export default function App() {
   const [keyInput, setKeyInput] = useState(() => getLS(LS.key, ""));
   const [modelInput, setModelInput] = useState(() => getModel());
   const [toast, setToast] = useState("");
+  const [chatPaper, setChatPaper] = useState(null);
 
   // restore last digest from cache (no auto-fetch — saves API credits)
   useEffect(() => {
@@ -420,7 +891,9 @@ export default function App() {
   const run = async () => {
     if (!getApiKey()) { setShowSettings(true); flash("Add an OpenRouter API key first"); return; }
     const queries = selected.map(l => PRESETS.find(p => p.label === l)?.query).filter(Boolean);
-    if (customTopic.trim()) queries.push(`all:${customTopic.trim()}`);
+    const customQuery = buildCustomQuery(customTopic);
+    const topicProfile = buildTopicProfile(selected, customTopic);
+    if (customQuery) queries.push(customQuery);
     if (queries.length === 0 && !useHF) { flash("Pick at least one topic or enable HF Daily"); return; }
 
     setStatus("loading"); setPapers([]); setErrorMsg(""); setView("all");
@@ -428,16 +901,14 @@ export default function App() {
 
     try {
       setPhase("Fetching papers from arXiv" + (useHF ? " + Hugging Face…" : "…"));
-      const perSource = Math.max(6, Math.ceil(count / Math.max(1, queries.length)));
+      const candidateTarget = Math.max(count * 3, count + 20);
+      const perSource = Math.max(12, Math.ceil(candidateTarget / Math.max(1, queries.length)));
       const buckets = await Promise.all([
         ...queries.map(q => fetchArxiv(q, perSource)),
-        ...(useHF ? [fetchHFDaily(count)] : []),
+        ...(useHF ? [fetchHFDaily(candidateTarget)] : []),
       ]);
 
-      let list = dedupe(buckets.flat());
-      // HF (upvoted) first, then keep newest
-      list.sort((a, b) => (b.source === "hf" ? 1 : 0) - (a.source === "hf" ? 1 : 0) || (b.date || "").localeCompare(a.date || ""));
-      list = list.slice(0, count);
+      let list = rankPapersForTopic(dedupe(buckets.flat()), topicProfile).slice(0, count);
       if (list.length === 0) throw new Error("No papers found for this selection. Try different topics.");
 
       setProgress({ done: 0, total: list.length });
@@ -452,12 +923,12 @@ export default function App() {
           collected[i] = await summarizeOne(list[i]);
           completed++;
           setProgress({ done: completed, total: list.length });
-          setPapers(collected.filter(Boolean));
+          setPapers(sortFinalPapers(collected.filter(Boolean)));
         }
       };
       await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-      const final = collected.filter(Boolean);
+      const final = sortFinalPapers(collected.filter(Boolean));
       setPapers(final);
       setLastLabel(activeLabel);
       setJSON(LS.cache, { papers: final, label: activeLabel, ts: Date.now() });
@@ -710,7 +1181,8 @@ export default function App() {
               {shown.length === 0 && <div className="empty">Nothing matches your filters.</div>}
               {shown.map((p, i) => (
                 <PaperCard key={(p.url || p.title) + i} paper={p} index={i}
-                  saved={isSaved(p)} onToggleSave={toggleSave} onTagClick={t => setTagFilter(t)} />
+                  saved={isSaved(p)} onToggleSave={toggleSave} onTagClick={t => setTagFilter(t)}
+                  onChat={setChatPaper} />
               ))}
             </div>
           </section>
@@ -724,6 +1196,7 @@ export default function App() {
         )}
       </main>
 
+      {chatPaper && <ChatModal paper={chatPaper} onClose={() => setChatPaper(null)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -1335,6 +1808,221 @@ input:disabled, select:disabled {
   font-size:13px;
   animation:rise .22s ease both;
 }
+/* ── chat with paper ── */
+.chat-btn {
+  width:34px;
+  min-width:34px;
+  height:34px;
+  border:1px solid transparent;
+  border-radius:var(--radius-sm);
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+  font-size:16px;
+  line-height:1;
+}
+.chat-btn:hover {
+  border-color:var(--line);
+  background:var(--surface-3);
+  color:var(--accent);
+}
+.card-actions {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:14px;
+  margin-top:4px;
+}
+.chat-cta {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:8px 14px;
+  border-radius:var(--radius-sm);
+  border:1px solid var(--accent);
+  background:var(--accent-soft);
+  color:var(--accent-strong);
+  font-size:13px;
+  font-weight:800;
+  cursor:pointer;
+  transition:transform .1s ease, box-shadow .16s ease;
+}
+.chat-cta:hover {
+  transform:translateY(-1px);
+  box-shadow:0 10px 22px rgba(23,105,170,.18);
+}
+.chat-overlay {
+  position:fixed;
+  inset:0;
+  z-index:80;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+  background:rgba(10,18,30,.55);
+  backdrop-filter:blur(3px);
+  animation:rise .18s ease both;
+}
+.chat-modal {
+  display:flex;
+  flex-direction:column;
+  width:100%;
+  max-width:720px;
+  height:min(86vh, 760px);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  background:var(--surface);
+  box-shadow:var(--shadow);
+  overflow:hidden;
+}
+.chat-head {
+  display:flex;
+  align-items:flex-start;
+  gap:14px;
+  padding:18px 20px;
+  border-bottom:1px solid var(--line);
+  background:var(--surface-2);
+}
+.chat-head-main { flex:1; min-width:0; }
+.chat-kicker {
+  color:var(--accent);
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+.chat-title {
+  margin:4px 0 6px;
+  font-size:16px;
+  font-weight:800;
+  line-height:1.35;
+  overflow-wrap:anywhere;
+}
+.chat-status {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:var(--muted);
+  font-family:var(--font-mono);
+  font-size:12px;
+}
+.chat-close {
+  width:34px;
+  min-width:34px;
+  height:34px;
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  background:var(--surface);
+  color:var(--muted);
+  cursor:pointer;
+  font-size:15px;
+  line-height:1;
+}
+.chat-close:hover { border-color:var(--accent); color:var(--accent); }
+.chat-body {
+  flex:1;
+  overflow-y:auto;
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+  padding:18px 20px;
+}
+.chat-intro-lead {
+  margin:0 0 12px;
+  color:var(--muted);
+  font-size:14px;
+}
+.chat-suggest {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:8px;
+}
+.chat-suggest button {
+  max-width:100%;
+  text-align:left;
+  padding:9px 13px;
+  border-radius:var(--radius-sm);
+  border:1px solid var(--line);
+  background:var(--surface-2);
+  color:var(--ink);
+  font-size:13px;
+  font-weight:600;
+  cursor:pointer;
+  transition:border-color .16s ease, color .16s ease;
+}
+.chat-suggest button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+.chat-suggest button:disabled { opacity:.5; cursor:not-allowed; }
+.chat-msg { display:flex; }
+.chat-msg.user { justify-content:flex-end; }
+.chat-msg.assistant { justify-content:flex-start; }
+.chat-bubble {
+  max-width:80%;
+  padding:11px 14px;
+  border-radius:14px;
+  font-size:14px;
+  line-height:1.6;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
+.chat-msg.user .chat-bubble {
+  background:var(--accent);
+  color:#fff;
+  border-bottom-right-radius:4px;
+}
+.chat-msg.assistant .chat-bubble {
+  background:var(--surface-3);
+  color:var(--ink);
+  border:1px solid var(--line);
+  border-bottom-left-radius:4px;
+}
+.chat-bubble.typing {
+  display:flex;
+  gap:5px;
+  align-items:center;
+}
+.chat-bubble.typing span {
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:var(--muted);
+  animation:blink 1.2s infinite ease-in-out;
+}
+.chat-bubble.typing span:nth-child(2) { animation-delay:.2s; }
+.chat-bubble.typing span:nth-child(3) { animation-delay:.4s; }
+@keyframes blink { 0%, 80%, 100% { opacity:.25; } 40% { opacity:1; } }
+.chat-input-row {
+  display:flex;
+  gap:10px;
+  padding:14px 20px;
+  border-top:1px solid var(--line);
+  background:var(--surface-2);
+}
+.chat-input { flex:1; }
+.chat-send {
+  min-height:42px;
+  padding:10px 20px;
+  border-radius:var(--radius-sm);
+  border:1px solid var(--accent);
+  background:var(--accent);
+  color:#fff;
+  font-size:13px;
+  font-weight:800;
+  cursor:pointer;
+}
+.chat-send:disabled { opacity:.5; cursor:not-allowed; }
+
+@media (max-width:640px) {
+  .chat-overlay { padding:0; }
+  .chat-modal {
+    height:100vh;
+    max-width:none;
+    border:0;
+    border-radius:0;
+  }
+  .chat-bubble { max-width:90%; }
+}
+
 @media (max-width:900px) {
   .masthead {
     grid-template-columns:1fr;
