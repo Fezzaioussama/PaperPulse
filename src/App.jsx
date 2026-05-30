@@ -37,6 +37,8 @@ const LS = {
 const TODAY = new Date().toLocaleDateString("en-US", {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
 });
+const APP_NAME = "PaperPulse";
+const APP_TAGLINE = "AI research briefings for fast paper triage.";
 
 // ── localStorage helpers ──
 const getLS = (k, fallback = null) => {
@@ -69,9 +71,9 @@ function extractJson(raw) {
 
 async function apiCall(prompt, maxTokens = 900) {
   const apiKey = getApiKey();
-  if (!apiKey) throw new Error("OpenRouter API key not found. Open Settings (⚙) to add one, or set REACT_APP_OPENROUTER_API_KEY.");
+  if (!apiKey) throw new Error("OpenRouter API key not found. Open Settings to add one, or set REACT_APP_OPENROUTER_API_KEY.");
   const model = getModel();
-  if (!model) throw new Error("No OpenRouter model set. Open Settings (⚙) to choose one.");
+  if (!model) throw new Error("No OpenRouter model set. Open Settings to choose one.");
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -79,7 +81,7 @@ async function apiCall(prompt, maxTokens = 900) {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
       "HTTP-Referer": "http://localhost",
-      "X-Title": "ArXiv Paper Briefings",
+      "X-Title": APP_NAME,
     },
     body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
   });
@@ -234,7 +236,7 @@ Respond with ONLY a JSON object (no markdown fences, no text before or after):
 
 // ── Markdown export ──
 function buildMarkdown(papers, label) {
-  const lines = [`# AI Paper Briefings — ${label}`, `_${TODAY}_`, ""];
+  const lines = [`# ${APP_NAME} - ${label}`, `_${APP_TAGLINE} ${TODAY}_`, ""];
   papers.forEach((p, i) => {
     lines.push(`## ${i + 1}. ${p.title}`);
     lines.push(`*${p.authors}${p.date ? " · " + p.date : ""}${p.source === "hf" ? " · 🤗 " + (p.upvotes || 0) + " upvotes" : ""}*`);
@@ -256,9 +258,9 @@ function buildMarkdown(papers, label) {
 // ──────────────────────────────────────────────────────────────────────────
 function ImpactDots({ n = 3 }) {
   return (
-    <span className="impact" title={`Impact ${n}/5`}>
+    <span className="impact" title={`Impact ${n}/5`} aria-label={`Impact ${n} out of 5`}>
       {[1, 2, 3, 4, 5].map(i => (
-        <span key={i} className={`idot ${i <= n ? "on" : ""}`} />
+        <span key={i} className={`idot ${i <= n ? "on" : ""}`} aria-hidden="true" />
       ))}
     </span>
   );
@@ -266,9 +268,24 @@ function ImpactDots({ n = 3 }) {
 
 function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
   const [open, setOpen] = useState(false);
+  const toggleOpen = () => setOpen(o => !o);
+  const onCardKeyDown = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleOpen();
+    }
+  };
+
   return (
-    <div className="card" style={{ animationDelay: `${(index % 6) * 50}ms` }}>
-      <div className="card-head" onClick={() => setOpen(o => !o)}>
+    <article className="card" style={{ animationDelay: `${(index % 6) * 50}ms` }}>
+      <div
+        className="card-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={toggleOpen}
+        onKeyDown={onCardKeyDown}
+      >
         <div className="card-num">{String(index + 1).padStart(2, "0")}</div>
         <div className="card-head-main">
           <div className="card-title">{paper.title}</div>
@@ -276,24 +293,26 @@ function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
             <span>{paper.authors}</span>
             {paper.date && <><span className="dot">·</span><span>{paper.date}</span></>}
             <span className={`src-badge ${paper.source}`}>
-              {paper.source === "hf" ? `🤗 ${paper.upvotes || 0}` : "arXiv"}
+              {paper.source === "hf" ? `HF ${paper.upvotes || 0}` : "arXiv"}
             </span>
             <ImpactDots n={paper.impact} />
           </div>
           {paper.tags?.length > 0 && (
             <div className="tag-row">
               {paper.tags.map(t => (
-                <button key={t} className="tag" onClick={e => { e.stopPropagation(); onTagClick(t); }}>#{t}</button>
+                <button key={t} type="button" className="tag" onClick={e => { e.stopPropagation(); onTagClick(t); }}>#{t}</button>
               ))}
             </div>
           )}
         </div>
         <button
+          type="button"
           className={`save-btn ${saved ? "on" : ""}`}
           title={saved ? "Remove bookmark" : "Bookmark"}
+          aria-label={saved ? `Remove bookmark for ${paper.title}` : `Bookmark ${paper.title}`}
           onClick={e => { e.stopPropagation(); onToggleSave(paper); }}
         >{saved ? "★" : "☆"}</button>
-        <div className={`chev ${open ? "up" : ""}`}>⌄</div>
+        <div className={`chev ${open ? "up" : ""}`} aria-hidden="true">⌄</div>
       </div>
 
       <div className="card-tldr">{paper.tldr}</div>
@@ -327,7 +346,7 @@ function PaperCard({ paper, index, saved, onToggleSave, onTagClick }) {
           )}
         </div>
       )}
-    </div>
+    </article>
   );
 }
 
@@ -369,7 +388,7 @@ export default function App() {
   // theme → body + persistence
   useEffect(() => {
     try { localStorage.setItem(LS.theme, theme); } catch {}
-    document.body.style.background = theme === "dark" ? "#16140f" : "#faf7f0";
+    document.body.style.background = theme === "dark" ? "#111111" : "#f5f7fb";
   }, [theme]);
 
   useEffect(() => { setJSON(LS.bookmarks, bookmarks); }, [bookmarks]);
@@ -487,7 +506,7 @@ export default function App() {
       const blob = new Blob([md], { type: "text/markdown" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `ai-briefings-${new Date().toISOString().slice(0, 10)}.md`;
+      a.download = `paperpulse-${new Date().toISOString().slice(0, 10)}.md`;
       a.click(); URL.revokeObjectURL(a.href);
       flash("Markdown downloaded");
     } else {
@@ -502,142 +521,208 @@ export default function App() {
     <div className={`app ${theme === "dark" ? "dark" : ""}`}>
       <style>{CSS}</style>
 
-      <div className="masthead">
-        <div>
-          <div className="kicker">arXiv + 🤗 · AI Research Digest</div>
-          <div className="h1">Paper <em>Briefings</em></div>
-        </div>
-        <div className="mast-right">
-          <div className="dateline">{TODAY}<br/>{count} papers / run</div>
-          <div className="mast-tools">
-            <button className="icon-btn" title="Toggle theme" onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}>
-              {theme === "dark" ? "☀" : "☾"}
-            </button>
-            <button className="icon-btn" title="Settings" onClick={() => setShowSettings(s => !s)}>⚙</button>
+      <main className="app-shell">
+        <header className="masthead">
+          <div className="brand-block">
+            <div className="kicker">AI research briefing workspace</div>
+            <h1 className="brand-name">{APP_NAME}</h1>
+            <p className="brand-copy">Triage fresh arXiv and Hugging Face papers by topic, impact, tags, and saved notes.</p>
           </div>
-        </div>
-      </div>
-
-      {showSettings && (
-        <div className="settings">
-          <div className="settings-grid">
-            <label className="fld">
-              <span className="ctl-label">OpenRouter API key</span>
-              <input type="password" placeholder="sk-or-v1-…" value={keyInput} onChange={e => setKeyInput(e.target.value)} />
-            </label>
-            <label className="fld">
-              <span className="ctl-label">Model</span>
-              <input placeholder="anthropic/claude-3.5-sonnet" value={modelInput} onChange={e => setModelInput(e.target.value)} />
-            </label>
-          </div>
-          <div className="settings-actions">
-            <button className="run-btn" onClick={saveSettings}>Save</button>
-            <span className="hint">Stored only in your browser (localStorage).</span>
-          </div>
-        </div>
-      )}
-
-      {/* topic chips */}
-      <div className="topics">
-        {PRESETS.map(p => (
-          <button key={p.label}
-            className={`chip ${selected.includes(p.label) ? "on" : ""}`}
-            disabled={status === "loading"}
-            onClick={() => toggleTopic(p.label)}>{p.label}</button>
-        ))}
-      </div>
-
-      <div className="controls">
-        <input className="custom-in" placeholder="+ custom topic…" value={customTopic}
-          disabled={status === "loading"}
-          onChange={e => setCustomTopic(e.target.value)}
-          onKeyDown={e => e.key === "Enter" && status !== "loading" && run()} />
-
-        <label className="toggle">
-          <input type="checkbox" checked={useHF} disabled={status === "loading"}
-            onChange={e => setUseHF(e.target.checked)} /> 🤗 HF Daily
-        </label>
-
-        <label className="toggle">
-          <span className="ctl-label">Count</span>
-          <select value={count} disabled={status === "loading"} onChange={e => setCount(+e.target.value)}>
-            {COUNT_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </label>
-
-        <button className="run-btn" onClick={run} disabled={status === "loading"}>
-          {status === "loading" ? "Working…" : "↻ Analyze"}
-        </button>
-      </div>
-
-      {status === "loading" && (
-        <div className="progress-wrap">
-          <div className="progress-top">
-            <span className="progress-label">Summaries generated</span>
-            <span className="progress-count">{progress.done}<small> / {progress.total || "…"}</small></span>
-          </div>
-          <div className="bar"><div className="bar-fill" style={{ width: `${pct}%` }} /></div>
-          <div className="spin-row"><div className="mini-spin" /><span className="spin-text">{phase}</span></div>
-        </div>
-      )}
-
-      {status === "error" && (
-        <div className="error-box">
-          <div>⚠ {errorMsg}</div>
-          <button className="run-btn" onClick={run}>↻ Try Again</button>
-        </div>
-      )}
-
-      {(papers.length > 0 || savedCount > 0) && (
-        <>
-          <div className="toolbar">
-            <div className="tabs">
-              <button className={`tab ${view === "all" ? "on" : ""}`} onClick={() => setView("all")}>
-                Digest {papers.length ? `(${papers.length})` : ""}
+          <div className="mast-right">
+            <div className="run-context" aria-label="Briefing context">
+              <span>Today</span>
+              <strong>{TODAY}</strong>
+              <span>{count} papers per run</span>
+              <span>{savedCount} saved</span>
+            </div>
+            <div className="mast-tools">
+              <button
+                type="button"
+                className="icon-btn"
+                title="Toggle theme"
+                aria-label="Toggle theme"
+                onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}
+              >
+                {theme === "dark" ? "Light" : "Dark"}
               </button>
-              <button className={`tab ${view === "saved" ? "on" : ""}`} onClick={() => setView("saved")}>
-                ★ Saved ({savedCount})
+              <button
+                type="button"
+                className="icon-btn"
+                title="Settings"
+                aria-label="Settings"
+                aria-expanded={showSettings}
+                onClick={() => setShowSettings(s => !s)}
+              >
+                Settings
               </button>
             </div>
-            <div className="filters">
-              <input className="search-in" placeholder="🔍 filter…" value={query} onChange={e => setQuery(e.target.value)} />
-              <select value={minImpact} onChange={e => setMinImpact(+e.target.value)} title="Minimum impact">
-                <option value={0}>impact: any</option>
-                <option value={3}>impact ≥ 3</option>
-                <option value={4}>impact ≥ 4</option>
-                <option value={5}>impact = 5</option>
-              </select>
-              <button className="ghost-btn" onClick={() => exportMd(false)}>⧉ Copy MD</button>
-              <button className="ghost-btn" onClick={() => exportMd(true)}>⭳ Export</button>
+          </div>
+        </header>
+
+        {showSettings && (
+          <section className="settings" aria-label="Settings">
+            <div className="settings-grid">
+              <label className="fld">
+                <span className="ctl-label">OpenRouter API key</span>
+                <input type="password" placeholder="sk-or-v1-..." value={keyInput} onChange={e => setKeyInput(e.target.value)} />
+              </label>
+              <label className="fld">
+                <span className="ctl-label">Model</span>
+                <input placeholder="anthropic/claude-3.5-sonnet" value={modelInput} onChange={e => setModelInput(e.target.value)} />
+              </label>
             </div>
+            <div className="settings-actions">
+              <button type="button" className="run-btn" onClick={saveSettings}>Save Settings</button>
+              <span className="hint">Stored only in this browser.</span>
+            </div>
+          </section>
+        )}
+
+        <section className="topic-panel" aria-label="Briefing setup">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Topics</span>
+              <p className="section-copy">Choose presets, add a custom query, then run the briefing.</p>
+            </div>
+            <span className="active-brief">Current: {activeLabel}</span>
           </div>
 
-          {allTags.length > 0 && (
-            <div className="tagbar">
-              <button className={`tag ${!tagFilter ? "on" : ""}`} onClick={() => setTagFilter("")}>all</button>
-              {allTags.map(t => (
-                <button key={t} className={`tag ${tagFilter === t ? "on" : ""}`}
-                  onClick={() => setTagFilter(f => f === t ? "" : t)}>#{t}</button>
-              ))}
-            </div>
-          )}
-
-          <div className="grid">
-            <div className="count-banner">
-              {shown.length} PAPER{shown.length !== 1 ? "S" : ""} · {(view === "saved" ? "BOOKMARKS" : (lastLabel || activeLabel)).toUpperCase()} · TAP A CARD FOR DETAIL
-            </div>
-            {shown.length === 0 && <div className="empty">Nothing matches your filters.</div>}
-            {shown.map((p, i) => (
-              <PaperCard key={(p.url || p.title) + i} paper={p} index={i}
-                saved={isSaved(p)} onToggleSave={toggleSave} onTagClick={t => setTagFilter(t)} />
+          <div className="topics">
+            {PRESETS.map(p => (
+              <button
+                key={p.label}
+                type="button"
+                className={`chip ${selected.includes(p.label) ? "on" : ""}`}
+                disabled={status === "loading"}
+                onClick={() => toggleTopic(p.label)}
+              >
+                {p.label}
+              </button>
             ))}
           </div>
-        </>
-      )}
 
-      {status === "idle" && papers.length === 0 && savedCount === 0 && (
-        <div className="empty hero-empty">Pick topics above and hit <b>Analyze</b> to build today's briefing.</div>
-      )}
+          <div className="controls">
+            <label className="fld compact">
+              <span className="ctl-label">Custom topic</span>
+              <input
+                className="custom-in"
+                placeholder="agent memory, sparse attention..."
+                value={customTopic}
+                disabled={status === "loading"}
+                onChange={e => setCustomTopic(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && status !== "loading" && run()}
+              />
+            </label>
+
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={useHF}
+                disabled={status === "loading"}
+                onChange={e => setUseHF(e.target.checked)}
+              />
+              <span>HF Daily source</span>
+            </label>
+
+            <label className="fld count-field">
+              <span className="ctl-label">Count</span>
+              <select value={count} disabled={status === "loading"} onChange={e => setCount(+e.target.value)}>
+                {COUNT_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+
+            <button type="button" className="run-btn primary-action" onClick={run} disabled={status === "loading"}>
+              {status === "loading" ? "Working..." : "Analyze"}
+            </button>
+          </div>
+        </section>
+
+        {status === "loading" && (
+          <section className="progress-wrap" aria-label="Generation progress">
+            <div className="progress-top">
+              <span className="progress-label">Summaries generated</span>
+              <span className="progress-count">{progress.done}<small> / {progress.total || "..."}</small></span>
+            </div>
+            <div className="bar" aria-hidden="true"><div className="bar-fill" style={{ width: `${pct}%` }} /></div>
+            <div className="spin-row"><div className="mini-spin" aria-hidden="true" /><span className="spin-text">{phase}</span></div>
+          </section>
+        )}
+
+        {status === "error" && (
+          <section className="error-box" role="alert">
+            <div>{errorMsg}</div>
+            <button type="button" className="run-btn" onClick={run}>Try Again</button>
+          </section>
+        )}
+
+        {(papers.length > 0 || savedCount > 0) && (
+          <section className="results" aria-label="Briefing results">
+            <div className="toolbar">
+              <div className="tabs" role="tablist" aria-label="Result view">
+                <button type="button" className={`tab ${view === "all" ? "on" : ""}`} onClick={() => setView("all")}>
+                  Digest {papers.length ? `(${papers.length})` : ""}
+                </button>
+                <button type="button" className={`tab ${view === "saved" ? "on" : ""}`} onClick={() => setView("saved")}>
+                  Saved ({savedCount})
+                </button>
+              </div>
+              <div className="filters">
+                <input
+                  className="search-in"
+                  aria-label="Filter papers"
+                  placeholder="Filter papers..."
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                />
+                <select value={minImpact} onChange={e => setMinImpact(+e.target.value)} title="Minimum impact" aria-label="Minimum impact">
+                  <option value={0}>Any impact</option>
+                  <option value={3}>Impact 3+</option>
+                  <option value={4}>Impact 4+</option>
+                  <option value={5}>Impact 5</option>
+                </select>
+                <button type="button" className="ghost-btn" onClick={() => exportMd(false)}>Copy MD</button>
+                <button type="button" className="ghost-btn" onClick={() => exportMd(true)}>Export MD</button>
+              </div>
+            </div>
+
+            {allTags.length > 0 && (
+              <div className="tagbar" aria-label="Filter by tag">
+                <button type="button" className={`tag ${!tagFilter ? "on" : ""}`} onClick={() => setTagFilter("")}>all</button>
+                {allTags.map(t => (
+                  <button
+                    key={t}
+                    type="button"
+                    className={`tag ${tagFilter === t ? "on" : ""}`}
+                    onClick={() => setTagFilter(f => f === t ? "" : t)}
+                  >
+                    #{t}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="grid">
+              <div className="count-banner">
+                <strong>{shown.length}</strong> paper{shown.length !== 1 ? "s" : ""} shown
+                <span>{view === "saved" ? "Bookmarks" : (lastLabel || activeLabel)}</span>
+                <span>Open a card for method, results, and links</span>
+              </div>
+              {shown.length === 0 && <div className="empty">Nothing matches your filters.</div>}
+              {shown.map((p, i) => (
+                <PaperCard key={(p.url || p.title) + i} paper={p} index={i}
+                  saved={isSaved(p)} onToggleSave={toggleSave} onTagClick={t => setTagFilter(t)} />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {status === "idle" && papers.length === 0 && savedCount === 0 && (
+          <section className="empty hero-empty">
+            <strong>No briefing yet.</strong>
+            <span>Start with a topic preset, keep HF Daily on for community signal, and run Analyze.</span>
+          </section>
+        )}
+      </main>
 
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -645,130 +730,684 @@ export default function App() {
 }
 
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-* { box-sizing: border-box; margin: 0; padding: 0; }
+* { box-sizing: border-box; }
+html, body, #root { width:100%; overflow-x:hidden; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button { appearance: none; }
 .app {
-  --bg:#faf7f0; --paper:#fffdf8; --ink:#1a1814; --sub:#6b6456;
-  --line:#e5ddcd; --accent:#c0392b; --accent2:#2d6a4f; --hl:#f4efe2; --chip:#fffdf8;
-  min-height:100vh; background:var(--bg); color:var(--ink);
-  font-family:'Space Grotesk',sans-serif; padding-bottom:80px;
+  --bg:#f5f7fb;
+  --surface:#ffffff;
+  --surface-2:#f9fbff;
+  --surface-3:#eef4fb;
+  --ink:#172033;
+  --muted:#667085;
+  --muted-2:#8793a4;
+  --line:#d8e1ec;
+  --line-strong:#b9c7d8;
+  --accent:#1769aa;
+  --accent-strong:#0f4f85;
+  --accent-soft:#e5f2fb;
+  --success:#1f7a55;
+  --success-soft:#e6f6ee;
+  --danger:#b42318;
+  --danger-soft:#fff0ed;
+  --focus:rgba(23,105,170,.2);
+  --shadow:0 18px 46px rgba(27,44,67,.08);
+  --radius:8px;
+  --radius-sm:6px;
+  --font-sans:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono:"SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  min-height:100vh;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:var(--font-sans);
+  overflow-x:hidden;
 }
 .app.dark {
-  --bg:#16140f; --paper:#211e17; --ink:#ece6d8; --sub:#9a917f;
-  --line:#36312611; --line:#3a342a; --accent:#e07a5f; --accent2:#81b29a; --hl:#27231b; --chip:#211e17;
+  color-scheme:dark;
+  --bg:#111111;
+  --surface:#181818;
+  --surface-2:#202020;
+  --surface-3:#262626;
+  --ink:#f4f6f8;
+  --muted:#b8bec8;
+  --muted-2:#8f98a6;
+  --line:#333333;
+  --line-strong:#4a4a4a;
+  --accent:#70b8ff;
+  --accent-strong:#acd8ff;
+  --accent-soft:#172c3b;
+  --success:#7bcfa6;
+  --success-soft:#153324;
+  --danger:#ff9c8f;
+  --danger-soft:#331c19;
+  --focus:rgba(112,184,255,.26);
+  --shadow:0 18px 46px rgba(0,0,0,.32);
 }
-.masthead { padding:36px 44px 24px; border-bottom:2px solid var(--ink);
-  display:flex; justify-content:space-between; align-items:flex-end; gap:24px; }
-.kicker { font-size:11px; letter-spacing:0.3em; text-transform:uppercase; color:var(--accent); margin-bottom:8px; font-weight:600; }
-.h1 { font-family:'Fraunces',serif; font-size:42px; line-height:0.95; font-weight:600; letter-spacing:-0.02em; }
-.h1 em { font-style:italic; color:var(--accent); }
-.mast-right { display:flex; flex-direction:column; align-items:flex-end; gap:10px; }
-.dateline { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--sub); text-align:right; line-height:1.6; }
-.mast-tools { display:flex; gap:8px; }
-.icon-btn { width:34px; height:34px; border:1px solid var(--line); background:var(--paper); color:var(--ink);
-  border-radius:4px; cursor:pointer; font-size:15px; transition:.15s; }
-.icon-btn:hover { border-color:var(--ink); }
-
-.settings { padding:20px 44px; border-bottom:1px solid var(--line); background:var(--hl); }
-.settings-grid { display:flex; gap:16px; flex-wrap:wrap; }
-.fld { display:flex; flex-direction:column; gap:6px; flex:1; min-width:240px; }
-.settings-actions { margin-top:14px; display:flex; align-items:center; gap:14px; }
-.hint { font-size:11px; color:var(--sub); }
-
-.topics { padding:18px 44px 4px; display:flex; gap:8px; flex-wrap:wrap; }
-.chip { font-family:'Space Grotesk',sans-serif; font-size:12px; font-weight:500; padding:6px 13px;
-  border:1px solid var(--line); background:var(--chip); color:var(--sub); border-radius:99px; cursor:pointer; transition:.15s; }
-.chip:hover { border-color:var(--ink); color:var(--ink); }
-.chip.on { background:var(--ink); color:var(--bg); border-color:var(--ink); }
-.chip:disabled { opacity:.5; cursor:not-allowed; }
-
-.controls { padding:14px 44px 20px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; border-bottom:1px solid var(--line); }
-.ctl-label { font-size:11px; letter-spacing:0.15em; text-transform:uppercase; color:var(--sub); }
-select, input { font-family:'Space Grotesk',sans-serif; font-size:13px; padding:9px 13px;
-  border:1px solid var(--line); background:var(--paper); color:var(--ink); border-radius:2px; outline:none; }
-select:focus, input:focus { border-color:var(--ink); }
-.custom-in, .search-in { font-family:'JetBrains Mono',monospace; font-size:12px; width:190px; }
-.custom-in::placeholder, .search-in::placeholder { color:var(--sub); }
-.toggle { display:flex; align-items:center; gap:7px; font-size:13px; color:var(--ink); cursor:pointer; }
-.toggle input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); padding:0; }
-.run-btn { font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:12px; letter-spacing:0.08em;
-  text-transform:uppercase; padding:10px 22px; background:var(--ink); color:var(--bg); border:none; cursor:pointer;
-  border-radius:2px; transition:opacity .2s, transform .1s; }
-.run-btn:hover { opacity:.85; } .run-btn:active { transform:scale(.97); }
-.run-btn:disabled { opacity:.4; cursor:not-allowed; }
-
-.progress-wrap { padding:28px 44px; }
-.progress-top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:12px; }
-.progress-label { font-size:13px; color:var(--sub); }
-.progress-count { font-family:'Fraunces',serif; font-size:28px; font-weight:600; }
-.progress-count small { font-size:14px; color:var(--sub); }
-.bar { height:4px; background:var(--line); border-radius:99px; overflow:hidden; }
-.bar-fill { height:100%; background:var(--accent); border-radius:99px; transition:width .5s ease; }
-.spin-row { display:flex; align-items:center; gap:10px; margin-top:16px; }
-.mini-spin { width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--accent);
-  border-radius:50%; animation:spin .7s linear infinite; }
+.app-shell {
+  width:calc(100% - 40px);
+  max-width:1180px;
+  margin:0 auto;
+  padding:30px 0 80px;
+}
+.masthead {
+  display:grid;
+  grid-template-columns:minmax(0, 1fr) auto;
+  gap:24px;
+  align-items:end;
+  padding:24px 0 22px;
+  border-bottom:1px solid var(--line);
+}
+.brand-block { max-width:720px; }
+.kicker {
+  color:var(--accent);
+  font-size:13px;
+  font-weight:800;
+  text-transform:uppercase;
+}
+.brand-name {
+  margin:8px 0 10px;
+  font-size:56px;
+  line-height:1;
+  font-weight:850;
+}
+.brand-copy {
+  max-width:640px;
+  color:var(--muted);
+  font-size:16px;
+  line-height:1.55;
+  overflow-wrap:anywhere;
+}
+.mast-right {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:14px;
+}
+.run-context {
+  display:grid;
+  gap:3px;
+  text-align:right;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.35;
+}
+.run-context strong {
+  color:var(--ink);
+  font-size:14px;
+  font-weight:750;
+}
+.mast-tools, .settings-actions, .filters, .tabs, .tagbar, .tag-row {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+}
+.mast-tools { gap:8px; justify-content:flex-end; }
+.icon-btn, .ghost-btn, .tab, .chip, .tag, .run-btn {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:var(--radius-sm);
+  border:1px solid var(--line);
+  cursor:pointer;
+  transition:background .16s ease, border-color .16s ease, color .16s ease, transform .1s ease, box-shadow .16s ease;
+}
+.icon-btn {
+  min-height:38px;
+  padding:8px 12px;
+  background:var(--surface);
+  color:var(--ink);
+  font-size:13px;
+  font-weight:700;
+}
+.icon-btn:hover, .ghost-btn:hover, .tab:hover, .chip:hover, .tag:hover {
+  border-color:var(--accent);
+  color:var(--accent);
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+.card-head:focus-visible,
+a:focus-visible {
+  outline:3px solid var(--focus);
+  outline-offset:2px;
+}
+.settings, .topic-panel, .progress-wrap, .error-box, .hero-empty {
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  background:var(--surface);
+  box-shadow:var(--shadow);
+}
+.settings {
+  margin-top:18px;
+  padding:20px;
+}
+.settings-grid {
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:16px;
+}
+.settings-actions {
+  margin-top:16px;
+  gap:12px;
+}
+.hint, .section-copy, .active-brief, .progress-label, .spin-text, .count-banner, .empty {
+  color:var(--muted);
+}
+.hint { font-size:12px; }
+.topic-panel {
+  margin-top:18px;
+  padding:20px;
+}
+.section-head {
+  display:flex;
+  justify-content:space-between;
+  gap:20px;
+  align-items:flex-start;
+  margin-bottom:16px;
+}
+.section-label, .ctl-label, .kp-label, .field-label {
+  display:block;
+  color:var(--muted);
+  font-size:12px;
+  font-weight:800;
+  text-transform:uppercase;
+}
+.section-copy {
+  margin:4px 0 0;
+  font-size:14px;
+  overflow-wrap:anywhere;
+}
+.active-brief {
+  max-width:420px;
+  padding:7px 10px;
+  border-radius:var(--radius-sm);
+  background:var(--surface-3);
+  font-size:12px;
+  line-height:1.4;
+  text-align:right;
+  overflow-wrap:anywhere;
+}
+.topics {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-bottom:18px;
+}
+.chip {
+  max-width:100%;
+  padding:8px 12px;
+  background:var(--surface-2);
+  color:var(--muted);
+  font-size:13px;
+  font-weight:700;
+  white-space:normal;
+}
+.chip.on {
+  background:var(--accent);
+  border-color:var(--accent);
+  color:#fff;
+}
+.chip:disabled, .run-btn:disabled {
+  cursor:not-allowed;
+  opacity:.52;
+}
+.controls {
+  display:grid;
+  grid-template-columns:minmax(240px, 1fr) auto 92px auto;
+  gap:12px;
+  align-items:end;
+}
+.controls > *, .filters > * { min-width:0; }
+.fld {
+  display:flex;
+  flex-direction:column;
+  gap:7px;
+  min-width:0;
+}
+.count-field { min-width:92px; }
+input, select {
+  width:100%;
+  min-height:42px;
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  background:var(--surface);
+  color:var(--ink);
+  padding:9px 12px;
+  outline:none;
+}
+input::placeholder { color:var(--muted-2); }
+input:disabled, select:disabled {
+  cursor:not-allowed;
+  opacity:.65;
+}
+.toggle {
+  min-height:42px;
+  display:flex;
+  align-items:center;
+  gap:9px;
+  color:var(--ink);
+  font-size:14px;
+  font-weight:700;
+  cursor:pointer;
+}
+.toggle input[type=checkbox] {
+  width:18px;
+  height:18px;
+  min-height:18px;
+  accent-color:var(--accent);
+  padding:0;
+}
+.run-btn {
+  min-height:42px;
+  padding:10px 18px;
+  background:var(--ink);
+  border-color:var(--ink);
+  color:var(--bg);
+  font-size:13px;
+  font-weight:800;
+}
+.primary-action {
+  min-width:132px;
+  background:var(--accent);
+  border-color:var(--accent);
+  color:#fff;
+}
+.run-btn:hover:not(:disabled) {
+  transform:translateY(-1px);
+  box-shadow:0 10px 22px rgba(23,105,170,.18);
+}
+.progress-wrap {
+  margin-top:18px;
+  padding:20px;
+}
+.progress-top {
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  gap:16px;
+  margin-bottom:12px;
+}
+.progress-count {
+  font-size:30px;
+  font-weight:850;
+}
+.progress-count small {
+  color:var(--muted);
+  font-size:14px;
+  font-weight:650;
+}
+.bar {
+  height:8px;
+  overflow:hidden;
+  border-radius:999px;
+  background:var(--surface-3);
+}
+.bar-fill {
+  height:100%;
+  border-radius:999px;
+  background:var(--accent);
+  transition:width .45s ease;
+}
+.spin-row {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-top:14px;
+}
+.mini-spin {
+  width:16px;
+  height:16px;
+  border:2px solid var(--line-strong);
+  border-top-color:var(--accent);
+  border-radius:50%;
+  animation:spin .8s linear infinite;
+}
 @keyframes spin { to { transform:rotate(360deg); } }
-.spin-text { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--sub); }
-
-.toolbar { padding:18px 44px 10px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
-.tabs { display:flex; gap:4px; }
-.tab { font-size:12px; font-weight:600; padding:7px 14px; border:1px solid var(--line); background:var(--paper);
-  color:var(--sub); border-radius:99px; cursor:pointer; }
-.tab.on { background:var(--ink); color:var(--bg); border-color:var(--ink); }
-.filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-.ghost-btn { font-size:12px; padding:8px 12px; border:1px solid var(--line); background:var(--paper);
-  color:var(--ink); border-radius:2px; cursor:pointer; }
-.ghost-btn:hover { border-color:var(--ink); }
-.tagbar { padding:4px 44px 10px; display:flex; gap:6px; flex-wrap:wrap; }
-.tag { font-family:'JetBrains Mono',monospace; font-size:10.5px; padding:3px 9px; border:1px solid var(--line);
-  background:var(--paper); color:var(--sub); border-radius:99px; cursor:pointer; }
-.tag:hover { border-color:var(--accent); color:var(--accent); }
-.tag.on { background:var(--accent); color:#fff; border-color:var(--accent); }
-
-.grid { padding:8px 44px 0; }
-.count-banner { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--sub);
-  padding:12px 0; border-bottom:1px solid var(--line); margin-bottom:8px; letter-spacing:0.05em; }
-.empty { padding:40px 0; text-align:center; color:var(--sub); font-size:14px; }
-.hero-empty { padding:70px 44px; }
-.card { background:var(--paper); border:1px solid var(--line); border-radius:4px; margin-bottom:12px;
-  overflow:hidden; animation:rise .45s ease both; }
-@keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:none; } }
-.card-head { display:flex; align-items:flex-start; gap:16px; padding:18px 20px 12px; cursor:pointer; }
-.card-num { font-family:'Fraunces',serif; font-size:20px; font-weight:600; color:var(--accent); min-width:32px; line-height:1.3; }
-.card-head-main { flex:1; }
-.card-title { font-family:'Fraunces',serif; font-size:18px; line-height:1.25; font-weight:600; margin-bottom:6px; }
-.card-meta { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--sub);
-  display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.dot { opacity:.5; }
-.src-badge { font-size:9.5px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); letter-spacing:.04em; }
-.src-badge.hf { color:var(--accent2); border-color:var(--accent2); }
-.src-badge.arxiv { color:var(--sub); }
-.impact { display:inline-flex; gap:2px; align-items:center; }
-.idot { width:7px; height:7px; border-radius:50%; background:var(--line); }
+.results { margin-top:20px; }
+.toolbar {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:14px;
+  padding-bottom:12px;
+  border-bottom:1px solid var(--line);
+}
+.tabs { gap:6px; }
+.tab {
+  padding:8px 13px;
+  background:var(--surface);
+  color:var(--muted);
+  font-size:13px;
+  font-weight:800;
+}
+.tab.on {
+  background:var(--ink);
+  border-color:var(--ink);
+  color:var(--bg);
+}
+.filters {
+  justify-content:flex-end;
+  gap:8px;
+}
+.search-in { width:220px; }
+.filters select { width:135px; }
+.ghost-btn {
+  min-height:38px;
+  padding:8px 12px;
+  background:var(--surface);
+  color:var(--ink);
+  font-size:13px;
+  font-weight:750;
+}
+.tagbar {
+  gap:6px;
+  padding:14px 0 4px;
+}
+.tag {
+  padding:5px 9px;
+  background:var(--surface-2);
+  color:var(--muted);
+  font-family:var(--font-mono);
+  font-size:11px;
+}
+.tag.on {
+  background:var(--accent-soft);
+  border-color:var(--accent);
+  color:var(--accent-strong);
+}
+.grid { padding-top:12px; }
+.count-banner {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px 12px;
+  align-items:center;
+  margin-bottom:12px;
+  padding:10px 0;
+  border-bottom:1px solid var(--line);
+  font-family:var(--font-mono);
+  font-size:12px;
+}
+.count-banner strong { color:var(--ink); }
+.count-banner span {
+  padding-left:12px;
+  border-left:1px solid var(--line);
+}
+.empty {
+  padding:42px 20px;
+  text-align:center;
+  font-size:14px;
+}
+.hero-empty {
+  display:grid;
+  gap:6px;
+  margin-top:18px;
+  padding:42px 20px;
+}
+.hero-empty strong {
+  color:var(--ink);
+  font-size:17px;
+}
+.card {
+  overflow:hidden;
+  margin-bottom:12px;
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  background:var(--surface);
+  animation:rise .38s ease both;
+}
+@keyframes rise {
+  from { opacity:0; transform:translateY(10px); }
+  to { opacity:1; transform:none; }
+}
+.card-head {
+  display:flex;
+  align-items:flex-start;
+  gap:14px;
+  padding:18px 18px 12px;
+  cursor:pointer;
+}
+.card-head:hover { background:var(--surface-2); }
+.card-num {
+  display:grid;
+  place-items:center;
+  min-width:40px;
+  height:32px;
+  border-radius:var(--radius-sm);
+  background:var(--accent-soft);
+  color:var(--accent-strong);
+  font-family:var(--font-mono);
+  font-size:13px;
+  font-weight:800;
+}
+.card-head-main {
+  min-width:0;
+  flex:1;
+}
+.card-title {
+  margin-bottom:7px;
+  font-size:18px;
+  line-height:1.35;
+  font-weight:800;
+  overflow-wrap:anywhere;
+}
+.card-meta {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:7px;
+  color:var(--muted);
+  font-family:var(--font-mono);
+  font-size:11px;
+  line-height:1.45;
+}
+.dot { opacity:.45; }
+.src-badge {
+  padding:2px 7px;
+  border:1px solid var(--line);
+  border-radius:999px;
+  font-size:10px;
+  font-weight:800;
+}
+.src-badge.hf {
+  border-color:var(--success);
+  color:var(--success);
+}
+.src-badge.arxiv { color:var(--muted); }
+.impact {
+  display:inline-flex;
+  gap:3px;
+  align-items:center;
+}
+.idot {
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:var(--line-strong);
+}
 .idot.on { background:var(--accent); }
-.tag-row { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; }
-.save-btn { background:none; border:none; cursor:pointer; font-size:20px; color:var(--sub); line-height:1; padding:0 2px; }
+.tag-row {
+  gap:6px;
+  margin-top:9px;
+}
+.save-btn {
+  width:34px;
+  min-width:34px;
+  height:34px;
+  border:1px solid transparent;
+  border-radius:var(--radius-sm);
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+  font-size:22px;
+  line-height:1;
+}
+.save-btn:hover {
+  border-color:var(--line);
+  background:var(--surface-3);
+}
 .save-btn.on { color:var(--accent); }
-.chev { font-size:22px; color:var(--sub); transition:transform .25s; line-height:1; user-select:none; }
+.chev {
+  color:var(--muted);
+  font-size:22px;
+  line-height:1;
+  transition:transform .22s ease;
+  user-select:none;
+}
 .chev.up { transform:rotate(180deg); }
-.card-tldr { padding:0 20px 16px 68px; font-size:14px; line-height:1.55; color:var(--ink); }
-.card-body { padding:18px 20px 20px 68px; border-top:1px solid var(--line); background:var(--hl); animation:rise .3s ease both; }
-.kp-label, .field-label { font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--accent2);
-  font-weight:600; margin-bottom:8px; display:block; }
-.kp-list { list-style:none; display:flex; flex-direction:column; gap:7px; margin-bottom:16px; }
-.kp-list li { font-size:13.5px; line-height:1.5; padding-left:18px; position:relative; color:var(--ink); }
-.kp-list li::before { content:'—'; position:absolute; left:0; color:var(--accent); }
-.field { margin-bottom:12px; }
-.field-val { font-size:13px; line-height:1.5; color:var(--ink); display:block; }
-.card-link { display:inline-block; margin-top:6px; font-family:'JetBrains Mono',monospace; font-size:12px;
-  color:var(--accent); text-decoration:none; border-bottom:1px solid var(--accent); padding-bottom:1px; }
-.error-box { margin:40px 44px; padding:24px; border:1px solid var(--accent); background:var(--hl); border-radius:4px; color:var(--accent); }
+.card-tldr {
+  padding:0 18px 18px 72px;
+  color:var(--ink);
+  font-size:14.5px;
+  line-height:1.6;
+  overflow-wrap:anywhere;
+}
+.card-body {
+  padding:18px 18px 20px 72px;
+  border-top:1px solid var(--line);
+  background:var(--surface-2);
+  animation:rise .28s ease both;
+}
+.kp-label, .field-label {
+  margin-bottom:8px;
+  color:var(--success);
+}
+.kp-list {
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  margin:0 0 16px;
+  padding:0;
+  list-style:none;
+}
+.kp-list li {
+  position:relative;
+  padding-left:18px;
+  color:var(--ink);
+  font-size:13.5px;
+  line-height:1.55;
+}
+.kp-list li::before {
+  content:'-';
+  position:absolute;
+  left:0;
+  color:var(--accent);
+  font-weight:900;
+}
+.field { margin-bottom:14px; }
+.field-val {
+  display:block;
+  color:var(--ink);
+  font-size:13.5px;
+  line-height:1.55;
+  overflow-wrap:anywhere;
+}
+.card-link {
+  display:inline-flex;
+  margin-top:4px;
+  color:var(--accent-strong);
+  font-size:13px;
+  font-weight:800;
+  text-decoration:none;
+}
+.card-link:hover { text-decoration:underline; }
+.error-box {
+  margin-top:18px;
+  padding:20px;
+  border-color:var(--danger);
+  background:var(--danger-soft);
+  color:var(--danger);
+}
 .error-box button { margin-top:14px; }
-.toast { position:fixed; bottom:28px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg);
-  font-size:13px; padding:11px 20px; border-radius:99px; box-shadow:0 6px 24px rgba(0,0,0,.18); animation:rise .25s ease both; z-index:50; }
+.toast {
+  position:fixed;
+  bottom:28px;
+  left:50%;
+  z-index:50;
+  transform:translateX(-50%);
+  max-width:calc(100% - 32px);
+  padding:11px 18px;
+  border-radius:999px;
+  background:var(--ink);
+  color:var(--bg);
+  box-shadow:0 10px 28px rgba(0,0,0,.18);
+  font-size:13px;
+  animation:rise .22s ease both;
+}
+@media (max-width:900px) {
+  .masthead {
+    grid-template-columns:1fr;
+    align-items:start;
+  }
+  .mast-right {
+    width:100%;
+    align-items:flex-start;
+  }
+  .run-context { text-align:left; }
+  .mast-tools { justify-content:flex-start; }
+  .controls {
+    grid-template-columns:1fr 1fr;
+  }
+  .primary-action { grid-column:1 / -1; }
+  .toolbar {
+    align-items:flex-start;
+    flex-direction:column;
+  }
+  .filters { justify-content:flex-start; }
+}
 @media (max-width:640px) {
-  .masthead,.topics,.controls,.progress-wrap,.grid,.toolbar,.tagbar,.settings { padding-left:20px; padding-right:20px; }
-  .h1 { font-size:30px; }
-  .card-tldr,.card-body { padding-left:20px; }
+  .app-shell {
+    width:calc(100% - 28px);
+    padding-top:18px;
+  }
+  .brand-name { font-size:40px; }
+  .brand-copy { font-size:15px; }
+  .settings-grid, .controls {
+    grid-template-columns:1fr;
+  }
+  .section-head {
+    flex-direction:column;
+  }
+  .topics {
+    display:grid;
+    grid-template-columns:repeat(2, minmax(0, 1fr));
+  }
+  .chip { width:100%; }
+  .active-brief {
+    width:100%;
+    max-width:none;
+    text-align:left;
+  }
+  .filters, .tabs, .search-in, .filters select, .ghost-btn {
+    width:100%;
+  }
+  .tab, .ghost-btn { justify-content:center; }
+  .count-banner span {
+    width:100%;
+    padding-left:0;
+    border-left:0;
+  }
+  .card-head {
+    gap:10px;
+    padding:16px 14px 10px;
+  }
+  .card-num {
+    min-width:34px;
+    height:30px;
+  }
+  .card-title { font-size:16px; }
+  .card-tldr, .card-body {
+    padding-left:14px;
+    padding-right:14px;
+  }
+}
+@media (prefers-reduced-motion:reduce) {
+  *, *::before, *::after {
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    scroll-behavior:auto !important;
+    transition-duration:.01ms !important;
+  }
 }
 `;
