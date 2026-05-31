@@ -94,8 +94,7 @@ const PRESETS = [
 
 const COUNT_OPTIONS = [10, 20, 30];
 const SUBJECT_MATCH_THRESHOLD = 4;
-const DEFAULT_MODEL = import.meta.env.REACT_APP_OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
-const ENV_KEY = import.meta.env.REACT_APP_OPENROUTER_API_KEY || "";
+const DEFAULT_MODEL = import.meta.env.VITE_OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
 
 const LS = {
   key: "openrouter_key",
@@ -123,7 +122,7 @@ const getJSON = (k, fallback) => {
 };
 const setJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
-const getApiKey = () => getLS(LS.key) || ENV_KEY;
+const getApiKey = () => getLS(LS.key) || "";
 const getModel = () => getLS(LS.model) || DEFAULT_MODEL;
 
 // ── JSON extraction from arbitrary model text ──
@@ -144,22 +143,33 @@ function extractJson(raw) {
 // ── chat-completions call taking a full message array (system/user/assistant) ──
 async function chatCall(messages, maxTokens = 8000) {
   const apiKey = getApiKey();
-  if (!apiKey) throw new Error("OpenRouter API key not found. Open Settings to add one, or set REACT_APP_OPENROUTER_API_KEY.");
   const model = getModel();
   if (!model) throw new Error("No OpenRouter model set. Open Settings to choose one.");
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const useBrowserKey = Boolean(apiKey);
+  const res = await fetch(useBrowserKey ? "https://openrouter.ai/api/v1/chat/completions" : "/api/chat", {
     method: "POST",
-    headers: {
+    headers: useBrowserKey ? {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
-      "HTTP-Referer": "http://localhost",
+      "HTTP-Referer": window.location.origin,
       "X-Title": APP_NAME,
+    } : {
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
+    body: JSON.stringify(useBrowserKey
+      ? { model, max_tokens: maxTokens, messages }
+      : { model, maxTokens, messages }),
   });
-  if (!res.ok) throw new Error(`API status ${res.status}`);
-  const data = await res.json();
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const fallback = useBrowserKey
+      ? `OpenRouter API status ${res.status}`
+      : `Server API status ${res.status}. Set OPENROUTER_API_KEY in Vercel, or add a browser key in Settings for local dev.`;
+    throw new Error(data?.error || data?.message || fallback);
+  }
+  if (!data) throw new Error("API returned an invalid response.");
   if (data.error) throw new Error(data.error.message || "API error");
   let raw = "";
   for (const choice of data.choices || []) if (choice.message?.content) raw += choice.message.content + "\n";
@@ -1439,7 +1449,6 @@ export default function App() {
   const isSaved = (paper) => !!bookmarks[normId(paper.url) || paper.title];
 
   const run = async () => {
-    if (!getApiKey()) { setShowSettings(true); flash("Add an OpenRouter API key first"); return; }
     const queries = selected.map(l => PRESETS.find(p => p.label === l)?.query).filter(Boolean);
     const customQuery = buildCustomQuery(customTopic);
     const topicProfile = buildTopicProfile(selected, customTopic);
@@ -1597,7 +1606,7 @@ export default function App() {
           <section className="settings" aria-label="Settings">
             <div className="settings-grid">
               <label className="fld">
-                <span className="ctl-label">OpenRouter API key</span>
+                <span className="ctl-label">Browser OpenRouter API key</span>
                 <input type="password" placeholder="sk-or-v1-..." value={keyInput} onChange={e => setKeyInput(e.target.value)} />
               </label>
               <label className="fld">
@@ -1607,7 +1616,7 @@ export default function App() {
             </div>
             <div className="settings-actions">
               <button type="button" className="run-btn" onClick={saveSettings}>Save Settings</button>
-              <span className="hint">Stored only in this browser.</span>
+              <span className="hint">Optional for local dev. On Vercel, use the server-side OPENROUTER_API_KEY environment variable.</span>
             </div>
           </section>
         )}
