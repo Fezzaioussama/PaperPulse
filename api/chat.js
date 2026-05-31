@@ -1,5 +1,9 @@
+// Model is always taken from the server environment — never from the client.
+// This prevents a public deployment from being abused to call expensive models.
 const DEFAULT_MODEL = "anthropic/claude-3.5-sonnet";
 const MAX_TOKENS_LIMIT = 8000;
+const MAX_MESSAGES = 24;
+const MAX_CONTENT_LENGTH = 12000;
 
 function sendJson(res, status, body) {
   res.status(status).setHeader("Content-Type", "application/json");
@@ -9,19 +13,19 @@ function sendJson(res, status, body) {
 function sanitizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
   return messages
-    .filter(message =>
-      message &&
-      ["system", "user", "assistant"].includes(message.role) &&
-      typeof message.content === "string"
+    .filter(
+      (m) =>
+        m &&
+        ["system", "user", "assistant"].includes(m.role) &&
+        typeof m.content === "string" &&
+        m.content.trim().length > 0
     )
-    .slice(-24)
-    .map(message => ({
-      role: message.role,
-      content: message.content.slice(0, 12000),
-    }));
+    .slice(-MAX_MESSAGES)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_CONTENT_LENGTH) }));
 }
 
 export default async function handler(req, res) {
+  // Only allow POST
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     return sendJson(res, 405, { error: "Method not allowed" });
@@ -43,11 +47,13 @@ export default async function handler(req, res) {
 
   const messages = sanitizeMessages(body.messages);
   if (messages.length === 0) {
-    return sendJson(res, 400, { error: "Request body must include chat messages." });
+    return sendJson(res, 400, { error: "Request body must include at least one chat message." });
   }
 
-  const model = String(body.model || process.env.OPENROUTER_MODEL || DEFAULT_MODEL).trim();
-  const requestedMax = Number.parseInt(body.maxTokens ?? body.max_tokens ?? MAX_TOKENS_LIMIT, 8000);
+  // Model is always server-controlled — client value is ignored.
+  const model = (process.env.OPENROUTER_MODEL || DEFAULT_MODEL).trim();
+
+  const requestedMax = Number.parseInt(body.maxTokens ?? body.max_tokens ?? MAX_TOKENS_LIMIT, 10);
   const maxTokens = Math.max(1, Math.min(Number.isFinite(requestedMax) ? requestedMax : MAX_TOKENS_LIMIT, MAX_TOKENS_LIMIT));
 
   try {
@@ -56,14 +62,10 @@ export default async function handler(req, res) {
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
-        "HTTP-Referer": req.headers.origin || "https://vercel.app",
+        "HTTP-Referer": "https://paperpulse.vercel.app",
         "X-Title": "PaperPulse",
       },
-      body: JSON.stringify({
-        model,
-        max_tokens: maxTokens,
-        messages,
-      }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
     });
 
     const text = await upstream.text();
