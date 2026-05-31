@@ -105,10 +105,10 @@ cp .env.example .env.local
 OPENROUTER_API_KEY=sk-or-v1-your-key-here
 
 # Optional: default model for the server route
-OPENROUTER_MODEL=deepseek/deepseek-v4-flash
+OPENROUTER_MODEL=deepseek/deepseek-v4-pro
 
 # Optional: default model shown in the browser Settings panel
-VITE_OPENROUTER_MODEL=deepseek/deepseek-v4-flash
+VITE_OPENROUTER_MODEL=deepseek/deepseek-v4-pro
 ```
 
 > **Security note**: Never prefix your secret key with `VITE_`. Vite bundles any `VITE_*` variable into the browser bundle. Only `VITE_OPENROUTER_MODEL` (a non-secret model ID) is safe to expose this way.
@@ -119,9 +119,9 @@ VITE_OPENROUTER_MODEL=deepseek/deepseek-v4-flash
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173).
+Open the local URL printed by Vite, usually [http://localhost:5173](http://localhost:5173).
 
-> **For the serverless route locally**: use `vercel dev` instead of `npm run dev`. The `/api/chat` endpoint is a Vercel function and is not started by the plain Vite dev server. As an alternative, add your OpenRouter key directly in the app's **Settings** panel — the browser will then call OpenRouter directly (bypassing the server route).
+`npm run dev` mounts the same `/api/chat` handler used by Vercel and loads server-only values from `.env.local`, including `OPENROUTER_API_KEY`. As an alternative, add your OpenRouter key directly in the app's **Settings** panel — the browser will then call OpenRouter directly (bypassing the server route).
 
 ---
 
@@ -134,7 +134,7 @@ Open [http://localhost:5173](http://localhost:5173).
 | Variable | Value |
 |---|---|
 | `OPENROUTER_API_KEY` | Your OpenRouter secret key |
-| `OPENROUTER_MODEL` | *(optional)* e.g. `anthropic/claude-3.5-sonnet` |
+| `OPENROUTER_MODEL` | *(optional)* e.g. `deepseek/deepseek-v4-pro` |
 | `VITE_OPENROUTER_MODEL` | *(optional)* model ID shown in the browser Settings panel |
 
 4. Deploy. The included `vercel.json` handles everything:
@@ -150,8 +150,8 @@ Open [http://localhost:5173](http://localhost:5173).
 | Variable | Required | Description |
 |---|---|---|
 | `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key. Used only in `api/chat.js`. |
-| `OPENROUTER_MODEL` | No | Server-side default model. Overridden per-request by the client. |
-| `VITE_OPENROUTER_MODEL` | No | Browser default model shown in the Settings panel. Falls back to `anthropic/claude-3.5-sonnet`. |
+| `OPENROUTER_MODEL` | No | Server-side model used by `/api/chat`. The client model is ignored for server-routed requests. |
+| `VITE_OPENROUTER_MODEL` | No | Browser default model shown in the Settings panel. Falls back to `deepseek/deepseek-v4-pro`. |
 
 ---
 

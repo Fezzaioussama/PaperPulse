@@ -94,7 +94,12 @@ const PRESETS = [
 
 const COUNT_OPTIONS = [10, 20, 30];
 const SUBJECT_MATCH_THRESHOLD = 4;
-const DEFAULT_MODEL = import.meta.env.VITE_OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
+// Semantic relevance (LLM-judged closeness of a paper to the user's custom topic).
+const MAX_TOPIC_QUERIES = 20;             // distinct arXiv queries the model fans a topic out into
+const SEMANTIC_RERANK_MAX = 100;          // max candidates sent to the model in one batched call
+const SEMANTIC_RELEVANCE_THRESHOLD = 70; // 0-100; below this a paper is not "near" the topic
+const SEMANTIC_MIN_KEEP = 10;             // never drop below this many so the list is never empty
+const DEFAULT_MODEL = import.meta.env.VITE_OPENROUTER_MODEL || "deepseek/deepseek-v4-pro";
 
 const LS = {
   key: "openrouter_key",
@@ -141,7 +146,7 @@ function extractJson(raw) {
 }
 
 // ── chat-completions call taking a full message array (system/user/assistant) ──
-async function chatCall(messages, maxTokens = 8000) {
+async function chatCall(messages, maxTokens = 10000) {
   const apiKey = getApiKey();
   const model = getModel();
   if (!model) throw new Error("No OpenRouter model set. Open Settings to choose one.");
@@ -177,7 +182,7 @@ async function chatCall(messages, maxTokens = 8000) {
 }
 
 // single-prompt convenience wrapper used by the per-paper summarizer
-const apiCall = (prompt, maxTokens = 8000) =>
+const apiCall = (prompt, maxTokens = 10000) =>
   chatCall([{ role: "user", content: prompt }], maxTokens);
 
 // ── generic fetch with CORS-proxy fallbacks; returns response text ──
@@ -835,11 +840,123 @@ function getPaperSubjectMatch(paper, profile) {
 
 function finalPaperScore(paper) {
   const impact = Math.max(1, Math.min(5, paper.impact || 3));
-  return (paper.relevanceScore || 0) + impact * 7 - (paper.abstractFallback ? 3 : 0);
+  // When a custom topic produced an LLM relevance score, let it drive ordering
+  // (0-100 → 0-60) so the closest papers float to the top; impact still matters.
+  const topicBonus = (paper.topicRelevance || 0) * 0.6;
+  return (paper.relevanceScore || 0) + topicBonus + impact * 7 - (paper.abstractFallback ? 3 : 0);
 }
 
 function sortFinalPapers(papers) {
   return [...papers].sort((a, b) => finalPaperScore(b) - finalPaperScore(a) || comparePaperFallback(a, b));
+}
+
+// ── semantic relevance: ask the chat model how closely each candidate matches
+// the reader's custom topic (by meaning, not just shared words). One batched
+// call; robust JSON parse; falls back to the incoming lexical order on failure.
+async function rerankBySemanticRelevance(papers, customTopic) {
+  const topic = customTopic.trim();
+  if (!topic || papers.length === 0) return papers;
+
+  const pool = papers.slice(0, SEMANTIC_RERANK_MAX);
+  const list = pool
+    .map((p, i) => `${i}. ${compactText(p.title)}\n${clipText(p.abstract, 320)}`)
+    .join("\n\n");
+
+  const prompt = `You are matching research papers to a reader's topic of interest.
+
+Topic of interest: "${topic}"
+
+Rate how closely each paper matches this topic on a 0-100 scale:
+- 90-100 = directly about this exact topic
+- 70-89  = strongly related, a core sub-area of it
+- 40-69  = loosely related, shares some concepts
+- 0-39   = a different topic
+Judge by meaning, not just shared words: count synonyms and closely related techniques as matches.
+
+Papers:
+${list}
+
+Respond with ONLY a JSON array (no prose, no markdown fences), one object per paper:
+[{"i": 0, "relevance": <0-100 integer>, "reason": "<= 8 word why"}]`;
+
+  try {
+    const parsed = extractJson(await apiCall(prompt, 10000));
+    if (Array.isArray(parsed) && parsed.length) {
+      const byIndex = new Map();
+      for (const r of parsed) {
+        const i = Number(r?.i);
+        if (Number.isInteger(i) && i >= 0 && i < pool.length) {
+          byIndex.set(i, {
+            relevance: Math.max(0, Math.min(100, Math.round(Number(r.relevance) || 0))),
+            reason: typeof r.reason === "string" ? r.reason.trim().slice(0, 80) : "",
+          });
+        }
+      }
+      if (byIndex.size) {
+        const scored = pool.map((p, i) => ({
+          ...p,
+          topicRelevance: byIndex.get(i)?.relevance ?? 0,
+          relevanceReason: byIndex.get(i)?.reason || "",
+        }));
+        // candidates past the model's window keep lexical order with no topic score
+        const rest = papers
+          .slice(SEMANTIC_RERANK_MAX)
+          .map(p => ({ ...p, topicRelevance: 0, relevanceReason: "" }));
+        return [...scored, ...rest].sort(
+          (a, b) => (b.topicRelevance || 0) - (a.topicRelevance || 0) || comparePaperFallback(a, b)
+        );
+      }
+    }
+  } catch (_) { /* fall through to the lexical order we were given */ }
+  return papers;
+}
+
+// Keep only papers that are genuinely "near" the topic, but never leave the
+// reader with an empty list — fall back to the top-scored handful.
+function applyRelevanceFilter(rankedPapers) {
+  const near = rankedPapers.filter(p => (p.topicRelevance || 0) >= SEMANTIC_RELEVANCE_THRESHOLD);
+  if (near.length >= SEMANTIC_MIN_KEEP) return near;
+  return rankedPapers.slice(0, Math.max(SEMANTIC_MIN_KEEP, near.length));
+}
+
+// ── query understanding: let the model read the topic and fan it out into
+// several DIFFERENT arXiv queries that cover complementary angles (exact
+// phrase, synonyms, a key sub-problem, a related technique). Together they
+// retrieve a broad-but-on-topic set. Falls back to [] (run() then uses the
+// mechanical buildCustomQuery so search always works).
+async function expandTopicToArxivQueries(customTopic) {
+  const topic = customTopic.trim();
+  if (!topic) return [];
+  const prompt = `A reader is interested in this research topic: "${topic}"
+
+Generate ${MAX_TOPIC_QUERIES} DIFFERENT arXiv API search queries that together cover this topic from complementary angles — e.g. the exact phrase, common synonyms / alternative names, a key sub-problem, and a closely related technique. Make them overlap as little as possible so together they retrieve a broad but on-topic set of papers.
+
+Rules for each query:
+- Use arXiv syntax: all:, ti:, abs:, cat: with AND / OR and quoted "phrases".
+- Capture meaning, not just literal words — use synonyms and alternative terminology.
+- Optionally constrain with 1-3 relevant categories (cs.CL, cs.AI, cs.LG, cs.CV, cs.RO, stat.ML).
+
+Respond with ONLY a JSON array of query strings (no prose, no markdown fences):
+["query 1", "query 2", ...]`;
+  try {
+    const parsed = extractJson(await apiCall(prompt, 10000));
+    if (Array.isArray(parsed)) {
+      const queries = parsed
+        .map(q => String(q || "").replace(/```/g, "").trim())
+        .filter(q => /\b(all|ti|abs|cat):/i.test(q) && q.length <= 600);
+      const unique = [...new Set(queries)].slice(0, MAX_TOPIC_QUERIES);
+      if (unique.length) return unique;
+    }
+  } catch (_) { /* fall back to the mechanical query in run() */ }
+  return [];
+}
+
+// Human-readable relevance class for the score the model assigns each paper.
+function relevanceTier(score = 0) {
+  if (score >= 85) return "Highly relevant";
+  if (score >= 70) return "Strongly related";
+  if (score >= SEMANTIC_RELEVANCE_THRESHOLD) return "Related";
+  return "Loosely related";
 }
 
 // ── arXiv ──
@@ -872,8 +989,9 @@ function parseArxivXml(xml) {
   }).filter(p => p.title && p.abstract);
 }
 
-async function fetchArxiv(query, count) {
-  const apiUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=submittedDate&sortOrder=descending&max_results=${count}`;
+async function fetchArxiv(query, count, sortBy = "submittedDate") {
+  const sort = sortBy === "relevance" ? "relevance" : "submittedDate";
+  const apiUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=${sort}&sortOrder=descending&max_results=${count}`;
   const xml = await fetchWithProxies(apiUrl);
   if (xml && xml.includes("<entry")) {
     const parsed = parseArxivXml(xml);
@@ -942,7 +1060,7 @@ Respond with ONLY a JSON object (no markdown fences, no text before or after):
 }`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const raw = await apiCall(sumPrompt, 1100);
+      const raw = await apiCall(sumPrompt, 10000);
       const s = extractJson(raw);
       if (s && (s.tldr || s.key_points)) {
         return {
@@ -1044,6 +1162,12 @@ function PaperCard({ paper, index, saved, onToggleSave, onTagClick, onChat }) {
               {paper.subjectMatch.reasons.map(reason => (
                 <span key={reason} className="subject-pill">{reason}</span>
               ))}
+            </div>
+          )}
+          {!paper.subjectMatch && paper.topicRelevance > 0 && (
+            <div className="subject-match" aria-label="Topic match">
+              <span className="subject-pill strong">{relevanceTier(paper.topicRelevance)} · {paper.topicRelevance}%</span>
+              {paper.relevanceReason && <span className="subject-pill">{paper.relevanceReason}</span>}
             </div>
           )}
         </div>
@@ -1279,7 +1403,7 @@ function ChatModal({ paper, onClose }) {
       const evidence = selectEvidenceChunks(paperChunks, retrievalQuery);
       const evidenceBlock = formatEvidenceForPrompt(evidence);
       const systemPrompt = buildChatSystemPrompt(paper, evidenceBlock, !!fullText);
-      const reply = await chatCall([{ role: "system", content: systemPrompt }, ...trimMessagesForModel(next)], 1000);
+      const reply = await chatCall([{ role: "system", content: systemPrompt }, ...trimMessagesForModel(next)], 10000);
       setMessages(m => [...m, { role: "assistant", content: reply.trim() || "(no response)" }]);
     } catch (e) {
       setMessages(m => [...m, { role: "assistant", content: "⚠️ " + (e.message || "Failed to get a response.") }]);
@@ -1449,26 +1573,54 @@ export default function App() {
   const isSaved = (paper) => !!bookmarks[normId(paper.url) || paper.title];
 
   const run = async () => {
-    const queries = selected.map(l => PRESETS.find(p => p.label === l)?.query).filter(Boolean);
-    const customQuery = buildCustomQuery(customTopic);
+    const presetQueries = selected.map(l => PRESETS.find(p => p.label === l)?.query).filter(Boolean);
     const topicProfile = buildTopicProfile(selected, customTopic);
-    if (customQuery) queries.push(customQuery);
-    if (queries.length === 0 && !useHF) { flash("Pick at least one topic or enable HF Daily"); return; }
+    const hasCustomTopic = customTopic.trim().length > 0;
+    if (presetQueries.length === 0 && !hasCustomTopic && !useHF) {
+      flash("Pick at least one topic or enable HF Daily"); return;
+    }
 
     setStatus("loading"); setPapers([]); setErrorMsg(""); setView("all");
     setProgress({ done: 0, total: 0 });
 
     try {
+      // Query understanding: let the model fan the topic out into several
+      // complementary arXiv queries (synonyms + sub-angles + categories), and
+      // keep the mechanical query too for recall. All are fetched relevance-
+      // sorted, not newest-first, then classified + re-ranked further below.
+      let customQueries = [];
+      if (hasCustomTopic) {
+        setPhase("Understanding your topic and planning searches…");
+        const smart = await expandTopicToArxivQueries(customTopic);
+        const mechanical = buildCustomQuery(customTopic);
+        customQueries = [...new Set([...smart, mechanical].filter(Boolean))];
+      }
+
       setPhase("Fetching papers from arXiv" + (useHF ? " + Hugging Face…" : "…"));
-      const candidateTarget = Math.max(count * 3, count + 20);
-      const perSource = Math.max(12, Math.ceil(candidateTarget / Math.max(1, queries.length)));
+      // Pull a wider net when a custom topic is set so the semantic re-rank has
+      // enough candidates to surface the genuinely close ones.
+      const candidateTarget = hasCustomTopic ? Math.max(count * 4, 50) : Math.max(count * 3, count + 20);
+      const queryCount = presetQueries.length + customQueries.length;
+      const perSource = Math.max(12, Math.ceil(candidateTarget / Math.max(1, queryCount)));
       const buckets = await Promise.all([
-        ...queries.map(q => fetchArxiv(q, perSource)),
+        ...presetQueries.map(q => fetchArxiv(q, perSource, "submittedDate")),
+        ...customQueries.map(q => fetchArxiv(q, perSource, "relevance")),
         ...(useHF ? [fetchHFDaily(candidateTarget)] : []),
       ]);
 
-      let list = rankPapersForTopic(dedupe(buckets.flat()), topicProfile).slice(0, count);
-      if (list.length === 0) throw new Error("No papers found for this selection. Try different topics.");
+      let ranked = rankPapersForTopic(dedupe(buckets.flat()), topicProfile);
+      if (ranked.length === 0) throw new Error("No papers found for this selection. Try different topics.");
+
+      // Re-rank by how closely each paper matches the typed topic, judged by the
+      // model (meaning, not just keywords), then keep only the near matches.
+      if (hasCustomTopic) {
+        setPhase(`Matching papers to “${customTopic.trim()}” by meaning…`);
+        ranked = await rerankBySemanticRelevance(ranked, customTopic);
+        ranked = applyRelevanceFilter(ranked);
+      }
+
+      let list = ranked.slice(0, count);
+      if (list.length === 0) throw new Error("No papers were close enough to that topic. Try broadening it.");
 
       setProgress({ done: 0, total: list.length });
       setPhase("Summarizing + scoring each paper…");
@@ -1611,7 +1763,7 @@ export default function App() {
               </label>
               <label className="fld">
                 <span className="ctl-label">Model</span>
-                <input placeholder="anthropic/claude-3.5-sonnet" value={modelInput} onChange={e => setModelInput(e.target.value)} />
+                <input placeholder="deepseek/deepseek-v4-pro" value={modelInput} onChange={e => setModelInput(e.target.value)} />
               </label>
             </div>
             <div className="settings-actions">
