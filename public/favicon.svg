@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">PaperPulse icon</title>
+  <desc id="desc">A paper sheet with a pulse line on a blue gradient square.</desc>
+  <defs>
+    <linearGradient id="bg" x1="12" x2="52" y1="4" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#70b8ff"/>
+      <stop offset=".5" stop-color="#1769aa"/>
+      <stop offset="1" stop-color="#0f4f85"/>
+    </linearGradient>
+    <linearGradient id="sheet" x1="19" x2="46" y1="12" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eaf5ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" fill="url(#bg)"/>
+  <path fill="#0b3e6b" fill-opacity=".22" d="M19 15h20l10 10v29a4 4 0 0 1-4 4H19a4 4 0 0 1-4-4V19a4 4 0 0 1 4-4Z"/>
+  <path fill="url(#sheet)" d="M18 11h21l10 10v31a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V15a4 4 0 0 1 4-4Z"/>
+  <path fill="#cfe7fb" d="M39 11v8a2 2 0 0 0 2 2h8l-10-10Z"/>
+  <path fill="none" stroke="#1769aa" stroke-linecap="round" stroke-linejoin="round" stroke-width="5" d="M21 37h7l4-13 6 23 4-11h6"/>
+  <path fill="none" stroke="#70b8ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 37h7l4-13 6 23 4-11h6"/>
+  <circle cx="32" cy="24" r="2.4" fill="#1769aa"/>
+</svg>
