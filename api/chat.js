@@ -1,7 +1,7 @@
 // Model is always taken from the server environment — never from the client.
 // This prevents a public deployment from being abused to call expensive models.
-const DEFAULT_MODEL = "anthropic/claude-3.5-sonnet";
-const MAX_TOKENS_LIMIT = 8000;
+const DEFAULT_MODEL = "deepseek/deepseek-v4-pro";
+const MAX_TOKENS_LIMIT = 10000;
 const MAX_MESSAGES = 24;
 const MAX_CONTENT_LENGTH = 12000;
 
