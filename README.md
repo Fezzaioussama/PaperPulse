@@ -1,189 +1,165 @@
-<div align="center">
-  <img src="public/favicon.svg" width="96" height="96" alt="PaperPulse icon" />
-  <h1>PaperPulse</h1>
-  <p><strong>AI research briefings for fast paper triage.</strong></p>
-  <p>
-    Fetch, rank, and summarize the latest arXiv and Hugging Face Daily papers by topic — with per-paper AI briefings and an interactive chat interface.
-  </p>
-</div>
+# PaperPulse
 
----
+> AI research briefings for fast paper triage — fetch, rank, and summarize arXiv and Hugging Face Daily papers, then chat with any one of them.
 
-## What it does
+Pick topic presets (LLMs, AI Agents, Diffusion, …) or type a custom subject, hit
+**Analyze**, and PaperPulse pulls fresh papers, deduplicates and topic-ranks
+them, and generates a structured briefing for each: TL;DR, key points, method,
+results, impact score, and tags. Open any paper's chat to ask questions answered
+from its full text, with citations.
 
-PaperPulse is a single-page React app that helps researchers and engineers quickly cut through the daily flood of AI/ML papers. You choose one or more topic presets (LLMs, AI Agents, Diffusion, etc.) or type any custom subject, then hit **Analyze**. The app:
+## Stack
 
-1. Fetches fresh papers from the [arXiv API](https://export.arxiv.org/api/) and the [Hugging Face Daily Papers feed](https://huggingface.co/api/daily_papers).
-2. Deduplicates, topic-ranks, and trims the pool to your requested count.
-3. Calls an LLM (via [OpenRouter](https://openrouter.ai)) to produce a structured briefing for every paper: TL;DR, key points, method summary, results, impact score, and tags.
-4. Lets you filter by tag, impact level, or a free-text keyword/subject query — and export everything as Markdown.
-5. Opens a **per-paper chat** where the LLM answers questions grounded in the full paper text fetched from `arxiv.org/html/` (with an `ar5iv` fallback).
+| Concern | Technology |
+|---|---|
+| Frontend | React 18, Vite 5 — no CSS framework, styles inlined as a JS template literal |
+| AI | [OpenRouter](https://openrouter.ai) — any supported model |
+| Paper sources | arXiv Atom API, Hugging Face Daily Papers JSON API |
+| Full text | `arxiv.org/html/{id}` → `ar5iv` fallback, via CORS proxies |
+| Deployment | Vercel — static site + Node serverless function |
 
----
+## Quick start
+
+Requires Node ≥ 18 and an [OpenRouter API key](https://openrouter.ai/keys).
+
+```bash
+npm install
+cp .env.example .env.local     # add your key
+npm run dev
+```
+
+Open the URL Vite prints, usually <http://localhost:5173>.
+
+`npm run dev` mounts the same `/api/chat` handler Vercel uses and loads
+server-only values from `.env.local`. Alternatively, paste an OpenRouter key
+into the app's **Settings** panel — the browser then calls OpenRouter directly,
+bypassing the server route.
+
+> **Never prefix the secret key with `VITE_`.** Vite bundles every `VITE_*`
+> variable into the browser bundle. Only `VITE_OPENROUTER_MODEL` — a non-secret
+> model id — is safe to expose that way.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `npm run dev` | Vite dev server (foreground) with the `/api/chat` handler |
+| `npm run build` | Production build to `dist/` |
+| `npm run preview` | Preview the built bundle |
+| `make install` | `npm install` |
+| `make run` / `make stop` / `make restart` | Run detached (PID in `.vite.pid`, logs in `.vite.log`) |
+| `make status` / `make logs` | Process state / dev server logs |
+| `make build` | Production build |
+
+Override the port with `make run PORT=3000`.
 
 ## Features
 
 | Feature | Details |
 |---|---|
-| **Topic presets** | 14 built-in presets (LLMs, AI Agents, Reasoning, RAG, RLHF/Alignment, Multimodal, Computer Vision, Diffusion, Mech Interp, Efficiency/MoE, Robotics/VLA, AI Safety, Benchmarks, Machine Learning) backed by arXiv category codes and keyword lists |
-| **Custom topics** | Free-text topic input; related preset terms are automatically expanded before the arXiv query is built |
-| **HF Daily source** | Toggle Hugging Face Daily Papers (community-upvoted, great for trending work) alongside arXiv |
-| **Paper count** | Choose 10, 20, or 30 papers per run |
-| **Structured briefings** | Per-paper TL;DR, 4 key points, method, results, impact (1–5 stars), relevance tags, and a "why it matters" blurb |
-| **Impact filter** | Show only papers with impact ≥ 3, ≥ 4, or exactly 5 |
-| **Tag filter** | Click any AI-generated tag to filter the digest to papers that share that tag |
-| **Subject finder** | Real-time subject search that scores and re-ranks the loaded papers without a new API call |
-| **Free-text filter** | Keyword filter across title, authors, abstract, TL;DR, method, results, and tags |
-| **Paper chat** | RAG-style chat grounded in the full paper text; evidence chunks are ranked by query relevance and cited with `[E1]` IDs |
-| **Bookmarks** | Star any paper to save it to the local Saved tab, persisted in `localStorage` |
-| **Markdown export** | Copy or download the current digest as a tidy Markdown file |
-| **Dark mode** | Toggle between light and dark themes, persisted across sessions |
-| **Result caching** | The last digest is cached in `localStorage` and restored on reload so you never start with a blank screen |
-| **Vercel serverless** | `/api/chat` proxies OpenRouter calls on the server so the API key is never exposed to the browser |
+| **Topic presets** | 14 presets (LLMs, AI Agents, Reasoning, RAG, RLHF/Alignment, Multimodal, CV, Diffusion, Mech Interp, Efficiency/MoE, Robotics/VLA, AI Safety, Benchmarks, ML) backed by arXiv category codes and keyword lists |
+| **Custom topics** | Free-text input; related preset terms are expanded before the arXiv query is built |
+| **HF Daily source** | Toggle Hugging Face Daily Papers (community-upvoted) alongside arXiv |
+| **Paper count** | 10, 20, or 30 per run |
+| **Structured briefings** | TL;DR, 4 key points, method, results, impact (1–5 stars), tags, "why it matters" |
+| **Impact filter** | Show only impact ≥ 3, ≥ 4, or exactly 5 |
+| **Tag filter** | Click any generated tag to filter the digest |
+| **Subject finder** | Re-ranks loaded papers in real time without a new API call |
+| **Free-text filter** | Across title, authors, abstract, TL;DR, method, results, tags |
+| **Paper chat** | RAG-style chat grounded in full paper text, evidence cited with `[E1]` ids |
+| **Bookmarks** | Star papers into a Saved tab, persisted in `localStorage` |
+| **Markdown export** | Copy or download the digest |
+| **Dark mode** | Persisted across sessions |
+| **Result caching** | Last digest restored on reload, so you never start blank |
 
----
-
-## Tech stack
-
-- **Frontend**: React 18, Vite 5 — no CSS framework, styles are inlined as a JS template literal
-- **AI**: [OpenRouter](https://openrouter.ai) — any model supported (Claude, Gemini, DeepSeek, etc.)
-- **Paper sources**: arXiv Atom API, Hugging Face Daily Papers JSON API
-- **Full-text**: `arxiv.org/html/{id}` → `ar5iv.labs.arxiv.org/html/{id}` fallback, fetched via CORS proxies
-- **Deployment**: Vercel (static site + Node.js serverless function)
-
----
-
-## Project layout
-
-```
-paperpulse/
-├── api/
-│   └── chat.js          # Vercel serverless function — proxies OpenRouter requests
-├── public/
-│   ├── favicon.svg      # App icon (paper + pulse line)
-│   ├── favicon-32x32.png
-│   ├── icon-192.png
-│   ├── icon-512.png
-│   ├── apple-touch-icon.png
-│   └── site.webmanifest
-├── src/
-│   ├── App.jsx          # Entire app: data fetching, ranking, UI, chat
-│   └── main.jsx         # React entry point
-├── index.html
-├── vite.config.js
-├── vercel.json          # Vercel build + serverless function config
-├── .env.example         # Environment variable template
-└── package.json
-```
-
----
-
-## Quick start (local)
-
-### Prerequisites
-
-- Node.js ≥ 18
-- An [OpenRouter API key](https://openrouter.ai/keys)
-
-### 1. Install dependencies
-
-```bash
-npm install
-```
-
-### 2. Configure environment variables
-
-Copy the example file and fill in your key:
-
-```bash
-cp .env.example .env.local
-```
-
-`.env.local`:
-```env
-# Used by the Vercel serverless function (api/chat.js) — never exposed to the browser
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
-
-# Optional: default model for the server route
-OPENROUTER_MODEL=deepseek/deepseek-v4-pro
-
-# Optional: default model shown in the browser Settings panel
-VITE_OPENROUTER_MODEL=deepseek/deepseek-v4-pro
-```
-
-> **Security note**: Never prefix your secret key with `VITE_`. Vite bundles any `VITE_*` variable into the browser bundle. Only `VITE_OPENROUTER_MODEL` (a non-secret model ID) is safe to expose this way.
-
-### 3. Run the dev server
-
-```bash
-npm run dev
-```
-
-Open the local URL printed by Vite, usually [http://localhost:5173](http://localhost:5173).
-
-`npm run dev` mounts the same `/api/chat` handler used by Vercel and loads server-only values from `.env.local`, including `OPENROUTER_API_KEY`. As an alternative, add your OpenRouter key directly in the app's **Settings** panel — the browser will then call OpenRouter directly (bypassing the server route).
-
----
-
-## Deploy on Vercel
-
-1. Push this repository to GitHub (or import it directly).
-2. [Import the project in Vercel](https://vercel.com/new).
-3. In **Project Settings → Environment Variables**, add:
-
-| Variable | Value |
-|---|---|
-| `OPENROUTER_API_KEY` | Your OpenRouter secret key |
-| `OPENROUTER_MODEL` | *(optional)* e.g. `deepseek/deepseek-v4-pro` |
-| `VITE_OPENROUTER_MODEL` | *(optional)* model ID shown in the browser Settings panel |
-
-4. Deploy. The included `vercel.json` handles everything:
-   - `buildCommand`: `npm run build`
-   - `outputDirectory`: `dist`
-   - Serverless function: `api/chat.js` (30 s max duration)
-   - SPA rewrite: all non-API routes → `index.html`
-
----
-
-## Environment variables reference
-
-| Variable | Required | Description |
-|---|---|---|
-| `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key. Used only in `api/chat.js`. |
-| `OPENROUTER_MODEL` | No | Server-side model used by `/api/chat`. The client model is ignored for server-routed requests. |
-| `VITE_OPENROUTER_MODEL` | No | Browser default model shown in the Settings panel. Falls back to `deepseek/deepseek-v4-pro`. |
-
----
-
-## How the chat works
-
-When you open a paper's chat:
-
-1. The app fetches the full HTML render of the paper from `arxiv.org/html/{id}` (or `ar5iv` as fallback) via CORS proxies.
-2. The text is split into structured sections (Abstract, Introduction, Method, Results, etc.) and then into overlapping chunks of ~1 700 characters.
-3. For each user message, the top-7 chunks most relevant to the query are selected using a BM25-style token scoring function with intent boosting (e.g. questions about "limitations" boost limitation/discussion sections).
-4. The selected evidence chunks and up to 12 recent turns of chat history are sent to the LLM with a system prompt that instructs it to cite evidence with `[E1]`, `[E2]` IDs and to say so when the evidence doesn't support an answer.
-5. Chat history is persisted per paper in `localStorage`.
-
----
-
-## Keyboard shortcuts
+### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
 | `Escape` | Close the paper chat modal |
-| `Enter` (in topic input) | Start a new Analyze run |
+| `Enter` (topic input) | Start a new Analyze run |
 
----
+## Project structure
 
-## Local development tips
+```
+api/
+  chat.js               # Vercel serverless function — proxies OpenRouter
+src/
+  App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~3k lines)
+  main.jsx              # React entry point
+public/                 # favicon.svg, PWA icons, site.webmanifest
+arxiv-batch-analyzer.jsx  # legacy 3-line re-export shim → src/App.jsx
+index.html
+vite.config.js
+vercel.json             # build config + serverless function + SPA rewrite
+```
 
-- The last digest is cached in `localStorage` under the key `pb_cache`. Clear it in DevTools → Application → Local Storage if you want a clean state.
-- Bookmarks are stored under `pb_bookmarks`; chat histories under `pb_paper_chats`.
-- The topic ranking algorithm (`scorePaperForTopic`) weights: arXiv category match (+8 per category), phrase matches in title (+18) and abstract (+8), token matches in title (+5) and abstract (+2), recency, HF upvotes, and quality signals ("state of the art", "benchmark", etc.).
-- CORS proxies used for arXiv full-text: direct → `corsproxy.io` → `api.allorigins.win`. If all fail, chat falls back to the abstract + generated briefing.
+`src/App.jsx` is a deliberate single-file app — data fetching, ranking, every
+component, and the chat system live in one ~3,000-line module. Know that before
+planning a change. The root `arxiv-batch-analyzer.jsx` is a compatibility shim
+for older imports and nothing references it.
 
----
+## Architecture
+
+```mermaid
+flowchart LR
+    UI["React SPA"] --> AX["arXiv Atom API"]
+    UI --> HF["HF Daily Papers"]
+    UI --> RANK["Dedupe + topic rank"]
+    RANK --> CHAT["/api/chat<br/>(Vercel function)"]
+    CHAT --> OR["OpenRouter"]
+    UI -.->|"optional direct call<br/>(key in Settings)"| OR
+```
+
+The serverless function exists so the API key stays server-side. The direct
+browser path is opt-in and only used when you paste a key into Settings.
+
+### How paper chat works
+
+1. Fetch the full HTML render from `arxiv.org/html/{id}`, falling back to
+   `ar5iv`, via CORS proxies (direct → `corsproxy.io` → `api.allorigins.win`).
+   If all fail, chat degrades to the abstract plus the generated briefing.
+2. Split the text into structured sections (Abstract, Introduction, Method,
+   Results, …) then into overlapping ~1,700-character chunks.
+3. For each message, select the top 7 chunks by a BM25-style token score with
+   intent boosting — a question about "limitations" boosts limitation and
+   discussion sections.
+4. Send those chunks plus up to 12 recent turns to the LLM, with a system prompt
+   requiring `[E1]`-style evidence citations and an explicit "the evidence
+   doesn't support this" escape hatch.
+5. Persist chat history per paper in `localStorage`.
+
+### Ranking
+
+`scorePaperForTopic` weights: arXiv category match (+8 each), phrase match in
+title (+18) and abstract (+8), token match in title (+5) and abstract (+2), plus
+recency, HF upvotes, and quality signals ("state of the art", "benchmark", …).
+
+## Configuration
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key — used only in `api/chat.js` |
+| `OPENROUTER_MODEL` | No | Server-side model for `/api/chat`. The client model is ignored for server-routed requests. |
+| `VITE_OPENROUTER_MODEL` | No | Browser default shown in the Settings panel |
+
+Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
+
+### localStorage keys
+
+`pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats`. Clear them in
+DevTools → Application → Local Storage for a clean state.
+
+## Deploy on Vercel
+
+1. Push to GitHub and [import the project](https://vercel.com/new).
+2. Under **Project Settings → Environment Variables**, add `OPENROUTER_API_KEY`
+   (and optionally `OPENROUTER_MODEL`, `VITE_OPENROUTER_MODEL`).
+3. Deploy.
+
+`vercel.json` handles the rest: `npm run build` → `dist`, `api/chat.js` as a
+serverless function with a 30-second max duration, and an SPA rewrite sending
+all non-API routes to `index.html`.
 
 ## License
 
