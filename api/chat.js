@@ -1,3 +1,5 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+
 // Model is always taken from the server environment — never from the client.
 // This prevents a public deployment from being abused to call expensive models.
 const DEFAULT_MODEL = "deepseek/deepseek-v4-pro";
@@ -31,6 +33,18 @@ export default async function handler(req, res) {
     return sendJson(res, 405, { error: "Method not allowed" });
   }
 
+  res.setHeader("Cache-Control", "no-store");
+  const accessToken = process.env.PAPERPULSE_ACCESS_TOKEN;
+  if (!accessToken || accessToken.length < 32) {
+    return sendJson(res, 503, { error: "Server chat is disabled. Use your own API key in Settings." });
+  }
+  const authorization = req.headers?.authorization;
+  const expected = createHash("sha256").update(`Bearer ${accessToken}`).digest();
+  const supplied = createHash("sha256").update(typeof authorization === "string" ? authorization : "").digest();
+  if (!timingSafeEqual(expected, supplied)) {
+    return sendJson(res, 401, { error: "Enter a valid server access token or your own API key in Settings." });
+  }
+
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     return sendJson(res, 500, { error: "OPENROUTER_API_KEY is not configured on the server." });
@@ -45,6 +59,9 @@ export default async function handler(req, res) {
     }
   }
 
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return sendJson(res, 400, { error: "Request body must be a JSON object." });
+  }
   const messages = sanitizeMessages(body.messages);
   if (messages.length === 0) {
     return sendJson(res, 400, { error: "Request body must include at least one chat message." });
@@ -74,12 +91,12 @@ export default async function handler(req, res) {
 
     if (!upstream.ok) {
       return sendJson(res, upstream.status, {
-        error: data?.error?.message || data?.error || `OpenRouter API status ${upstream.status}`,
+        error: `OpenRouter API status ${upstream.status}`,
       });
     }
 
     return sendJson(res, 200, data || {});
   } catch (error) {
-    return sendJson(res, 502, { error: error.message || "OpenRouter request failed." });
+    return sendJson(res, 502, { error: "OpenRouter request failed." });
   }
 }

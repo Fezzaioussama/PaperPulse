@@ -127,7 +127,11 @@ const getJSON = (k, fallback) => {
 };
 const setJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
-const getApiKey = () => getLS(LS.key) || "";
+// Credentials live only in this tab's memory; erase keys saved by older versions.
+try { localStorage.removeItem(LS.key); } catch {}
+let browserApiKey = "";
+let serverAccessToken = "";
+const getApiKey = () => browserApiKey;
 const getModel = () => getLS(LS.model) || DEFAULT_MODEL;
 
 // ── JSON extraction from arbitrary model text ──
@@ -161,6 +165,7 @@ async function chatCall(messages, maxTokens = 10000) {
       "X-Title": APP_NAME,
     } : {
       "Content-Type": "application/json",
+      ...(serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {}),
     },
     body: JSON.stringify(useBrowserKey
       ? { model, max_tokens: maxTokens, messages }
@@ -171,7 +176,7 @@ async function chatCall(messages, maxTokens = 10000) {
   if (!res.ok) {
     const fallback = useBrowserKey
       ? `OpenRouter API status ${res.status}`
-      : `Server API status ${res.status}. Set OPENROUTER_API_KEY in Vercel, or add a browser key in Settings for local dev.`;
+      : `Server API status ${res.status}. Enter a server access token or your own API key in Settings.`;
     throw new Error(data?.error || data?.message || fallback);
   }
   if (!data) throw new Error("API returned an invalid response.");
@@ -1525,7 +1530,8 @@ export default function App() {
   const [bookmarks, setBookmarks] = useState(() => getJSON(LS.bookmarks, {}));
   const [theme, setTheme] = useState(() => getLS(LS.theme, "light"));
   const [showSettings, setShowSettings] = useState(false);
-  const [keyInput, setKeyInput] = useState(() => getLS(LS.key, ""));
+  const [keyInput, setKeyInput] = useState("");
+  const [accessTokenInput, setAccessTokenInput] = useState("");
   const [modelInput, setModelInput] = useState(() => getModel());
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
@@ -1652,9 +1658,10 @@ export default function App() {
   };
 
   const saveSettings = () => {
+    browserApiKey = keyInput.trim();
+    serverAccessToken = accessTokenInput.trim();
     try {
-      if (keyInput.trim()) localStorage.setItem(LS.key, keyInput.trim());
-      else localStorage.removeItem(LS.key);
+      localStorage.removeItem(LS.key);
       if (modelInput.trim()) localStorage.setItem(LS.model, modelInput.trim());
     } catch {}
     setShowSettings(false);
@@ -1762,13 +1769,17 @@ export default function App() {
                 <input type="password" placeholder="sk-or-v1-..." value={keyInput} onChange={e => setKeyInput(e.target.value)} />
               </label>
               <label className="fld">
+                <span className="ctl-label">Server access token</span>
+                <input type="password" autoComplete="off" placeholder="For private server access" value={accessTokenInput} onChange={e => setAccessTokenInput(e.target.value)} />
+              </label>
+              <label className="fld">
                 <span className="ctl-label">Model</span>
                 <input placeholder="deepseek/deepseek-v4-pro" value={modelInput} onChange={e => setModelInput(e.target.value)} />
               </label>
             </div>
             <div className="settings-actions">
               <button type="button" className="run-btn" onClick={saveSettings}>Save Settings</button>
-              <span className="hint">Optional for local dev. On Vercel, use the server-side OPENROUTER_API_KEY environment variable.</span>
+              <span className="hint">Use your own API key or a private server access token. Credentials are kept only until this tab reloads.</span>
             </div>
           </section>
         )}

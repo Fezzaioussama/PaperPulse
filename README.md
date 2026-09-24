@@ -12,7 +12,7 @@ from its full text, with citations.
 
 | Concern | Technology |
 |---|---|
-| Frontend | React 18, Vite 5 — no CSS framework, styles inlined as a JS template literal |
+| Frontend | React 18, Vite 6 — no CSS framework, styles inlined as a JS template literal |
 | AI | [OpenRouter](https://openrouter.ai) — any supported model |
 | Paper sources | arXiv Atom API, Hugging Face Daily Papers JSON API |
 | Full text | `arxiv.org/html/{id}` → `ar5iv` fallback, via CORS proxies |
@@ -24,7 +24,7 @@ Requires Node ≥ 18 and an [OpenRouter API key](https://openrouter.ai/keys).
 
 ```bash
 npm install
-cp .env.example .env.local     # add your key
+cp .env.example .env.local     # add your API key and a random server access token
 npm run dev
 ```
 
@@ -33,7 +33,9 @@ Open the URL Vite prints, usually <http://localhost:5173>.
 `npm run dev` mounts the same `/api/chat` handler Vercel uses and loads
 server-only values from `.env.local`. Alternatively, paste an OpenRouter key
 into the app's **Settings** panel — the browser then calls OpenRouter directly,
-bypassing the server route.
+bypassing the server route. Server-routed requests require the private access
+token in Settings. Both credentials stay in tab memory and are cleared on reload;
+keys saved in localStorage by earlier versions are removed automatically.
 
 > **Never prefix the secret key with `VITE_`.** Vite bundles every `VITE_*`
 > variable into the browser bundle. Only `VITE_OPENROUTER_MODEL` — a non-secret
@@ -140,6 +142,7 @@ recency, HF upvotes, and quality signals ("state of the art", "benchmark", …).
 | Variable | Required | Purpose |
 |---|---|---|
 | `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key — used only in `api/chat.js` |
+| `PAPERPULSE_ACCESS_TOKEN` | Yes (server) | Private access token, at least 32 characters; generate with `openssl rand -hex 32`. Without it, server chat is disabled. Never expose it with a `VITE_` prefix. |
 | `OPENROUTER_MODEL` | No | Server-side model for `/api/chat`. The client model is ignored for server-routed requests. |
 | `VITE_OPENROUTER_MODEL` | No | Browser default shown in the Settings panel |
 
@@ -154,12 +157,31 @@ DevTools → Application → Local Storage for a clean state.
 
 1. Push to GitHub and [import the project](https://vercel.com/new).
 2. Under **Project Settings → Environment Variables**, add `OPENROUTER_API_KEY`
+   and a randomly generated `PAPERPULSE_ACCESS_TOKEN`
    (and optionally `OPENROUTER_MODEL`, `VITE_OPENROUTER_MODEL`).
-3. Deploy.
+3. Deploy. Enter the private access token in Settings to use server-funded chat.
+   Public visitors can enter their own OpenRouter API key instead.
 
 `vercel.json` handles the rest: `npm run build` → `dist`, `api/chat.js` as a
 serverless function with a 30-second max duration, and an SPA rewrite sending
 all non-API routes to `index.html`.
+
+## Privacy and deployment security
+
+Chat messages, paper excerpts, and analysis prompts are sent to OpenRouter and
+its selected model provider. Paper-fetch fallback services (`corsproxy.io` and
+`api.allorigins.win`) receive requested URLs, which can include research queries.
+Bookmarks, digests, and paper chats persist in browser localStorage; clear site
+data to remove them. Credentials are held only in tab memory.
+
+The server access token is intended for a small, trusted group. Do not publish
+it or embed it in the frontend. Authentication does not impose usage quotas:
+configure provider spending limits and deployment-level rate limiting before
+sharing server-funded access widely.
+
+Older revisions supported API keys in frontend environment variables. If those
+revisions were deployed with real keys, revoke those keys and remove old
+accessible deployments. Updating this source cannot clean existing bundles.
 
 ## License
 
