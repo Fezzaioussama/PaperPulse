@@ -80,6 +80,8 @@ Override the port with `make run PORT=3000`.
 | **Paper chat** | RAG-style chat grounded in full paper text, evidence cited with `[E1]` ids |
 | **Research agent** | LangGraph agent: query planning → relevance grading (with iterative query refinement) → idea extraction → cross-paper theme regrouping → parallel understand / challenge / practice / compare analyses → cited synthesis report with a self-review + revision pass, streamed live |
 | **Knowledge base** | Research runs saved in `localStorage` (`pb_knowledge`); select runs and chat across them — the agent can also search arXiv and read papers mid-answer |
+| **Paper figures** | The agent scrapes each kept paper's HTML render for its first figures (image + caption) and shows them on the paper rows |
+| **Knowledge graph** | An interactive papers ↔ themes ↔ concepts graph per run: hover traces connections, click a paper to chat with it; plus a papers-by-year chart (categorical colors CVD-validated for both themes) |
 | **RAG / semantic search** | Research runs and library sources are chunked, embedded, and stored in a browser-side vector index; each knowledge-chat question retrieves the best excerpts as cited `[E#]` evidence |
 | **Library** | Add sources beyond research runs — an arXiv id, any public article URL (fetched and cleaned server-side), or pasted text — and they join the retrieval index |
 | **Embedding platforms** | Choose in Settings: off (lexical only), a local in-browser model (`all-MiniLM-L6-v2` via transformers.js, ~25MB one-time download, fully private), or any OpenAI-compatible embeddings API (OpenAI, Jina, Mistral, Ollama, ...) |
@@ -166,8 +168,9 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   then run in parallel — **understand** (key concepts explained plainly),
   **challenge** (a skeptical review: weaknesses, assumptions, conflicting
   claims, gaps, open questions), **practice** (scenario → approach
-  recommendations, pitfalls, resources), and **compare** (a per-paper
-  approach/contribution/evidence/limitation matrix) — before a final markdown
+  recommendations, pitfalls, resources), **compare** (a per-paper
+  approach/contribution/evidence/limitation matrix), and **figures** (no LLM —
+  scrapes each kept paper's HTML render for its first figures) — before a final markdown
   report with `[n]` citations (out-of-range citations are stripped
   mechanically). The agent then **reviews its own report** against the
   extracted ideas (unsupported claims, mis-citations, ignored disagreements)

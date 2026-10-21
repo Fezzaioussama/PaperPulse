@@ -128,6 +128,7 @@ export default async function handler(req, res) {
           critique: final.critique,
           practice: final.practice,
           comparison: final.comparison,
+          figures: final.figures,
           report: final.report,
           startedAt,
           finishedAt: new Date().toISOString(),

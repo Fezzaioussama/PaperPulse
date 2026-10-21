@@ -2,7 +2,7 @@ import { Annotation, StateGraph, MessagesAnnotation, START, END } from "@langcha
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { fetchArxiv, fetchPaperTextNode, dedupe } from "./arxiv.js";
+import { fetchArxiv, fetchPaperTextNode, fetchPaperFigures, dedupe } from "./arxiv.js";
 import {
   extractJson, compactText, clipText, normId,
   lexicalTopicScore, buildTopicLexicalProfile,
@@ -194,6 +194,7 @@ const ResearchState = Annotation.Root({
   critique: Annotation({ reducer: (a = null, b = null) => b ?? a, default: () => null }),
   practice: Annotation({ reducer: (a = null, b = null) => b ?? a, default: () => null }),
   comparison: Annotation({ reducer: replaceIfNew, default: () => [] }),
+  figures: Annotation({ reducer: replaceIfNew, default: () => [] }),
   report: Annotation({ reducer: (a = "", b = "") => b || a, default: () => "" }),
   reportReview: Annotation({ reducer: (a = null, b = null) => b ?? a, default: () => null }),
   iterations: Annotation({ reducer: (a = 0, b = 0) => a + b, default: () => 0 }),
@@ -562,6 +563,28 @@ Respond with ONLY a JSON object (no prose, no markdown fences):
   return { comparison: [] };
 }
 
+// No LLM: scrape each kept paper's HTML render for its first figures so the
+// briefing can show them (runs in the parallel fan-out; failures just skip).
+async function collectFigures(state, config) {
+  const { emit = noop } = config.configurable;
+  emit({ type: "phase", phase: "figures", label: "Collecting paper figures" });
+  const targets = state.relevant.slice(0, state.limits.maxExtract);
+  const out = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < targets.length) {
+      const p = targets[cursor++];
+      try {
+        const figures = await fetchPaperFigures(p.url, 3);
+        if (figures.length) out.push({ paperId: paperId(p), figures });
+      } catch (_) { /* figures are decoration; skip */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker));
+  if (out.length) emit({ type: "partial", key: "figures", value: out });
+  return { figures: out };
+}
+
 // ── Reflection: the agent reviews its own report against the evidence and
 //    revises it once when the review finds real problems. ──
 
@@ -701,6 +724,7 @@ export function buildResearchGraph() {
     .addNode("challenge_claims", challengeClaims)
     .addNode("practical_guide", practicalGuide)
     .addNode("compare_papers", comparePapers)
+    .addNode("collect_figures", collectFigures)
     .addNode("synthesize", synthesize)
     .addNode("review_report", reviewReport)
     .addNode("revise_report", reviseReport)
@@ -710,12 +734,13 @@ export function buildResearchGraph() {
     .addConditionalEdges("grade_relevance", decideNext, { refine: "refine_queries", extract: "extract_ideas" })
     .addEdge("refine_queries", "search_arxiv")
     .addEdge("extract_ideas", "regroup_themes")
-    // Fan out: the four analysis passes run concurrently, then join.
+    // Fan out: the analysis passes (and figure scraping) run concurrently, then join.
     .addEdge("regroup_themes", "understand_concepts")
     .addEdge("regroup_themes", "challenge_claims")
     .addEdge("regroup_themes", "practical_guide")
     .addEdge("regroup_themes", "compare_papers")
-    .addEdge(["understand_concepts", "challenge_claims", "practical_guide", "compare_papers"], "synthesize")
+    .addEdge("regroup_themes", "collect_figures")
+    .addEdge(["understand_concepts", "challenge_claims", "practical_guide", "compare_papers", "collect_figures"], "synthesize")
     // Reflection: review the report against the evidence; revise at most once.
     .addEdge("synthesize", "review_report")
     .addConditionalEdges("review_report", decideReview, { revise: "revise_report", done: END })

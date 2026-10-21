@@ -89,9 +89,7 @@ export function htmlToTextNode(html) {
     .trim();
 }
 
-export async function fetchPaperTextNode(arxivIdOrUrl) {
-  const id = normId(String(arxivIdOrUrl || ""));
-  if (!/^\d{4}\.\d{4,5}$/.test(id)) return "";
+async function fetchArxivHtml(id) {
   const urls = [
     `https://arxiv.org/html/${id}`,
     `https://ar5iv.labs.arxiv.org/html/${id}`,
@@ -101,10 +99,45 @@ export async function fetchPaperTextNode(arxivIdOrUrl) {
       const res = await fetch(u, { signal: AbortSignal.timeout(12000) });
       if (!res.ok) continue;
       const html = await res.text();
-      if (!html || !/<\/?(article|main|body)/i.test(html)) continue;
-      const text = htmlToTextNode(html);
-      if (text && text.length > 500) return text.slice(0, FULLTEXT_LIMIT);
+      if (html && /<\/?(article|main|body)/i.test(html)) return { html, base: u };
     } catch (_) { /* next source */ }
   }
-  return "";
+  return null;
+}
+
+export async function fetchPaperTextNode(arxivIdOrUrl) {
+  const id = normId(String(arxivIdOrUrl || ""));
+  if (!/^\d{4}\.\d{4,5}$/.test(id)) return "";
+  const got = await fetchArxivHtml(id);
+  if (!got) return "";
+  const text = htmlToTextNode(got.html);
+  return text && text.length > 500 ? text.slice(0, FULLTEXT_LIMIT) : "";
+}
+
+// Pull the first figures (image + caption) out of a paper's HTML render.
+// Relative srcs resolve against the page URL, e.g. arxiv.org/html/<id>/x1.png.
+export function extractFigures(html, baseUrl, max = 4) {
+  const figures = [];
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const figRe = /<figure[^>]*>([\s\S]*?)<\/figure>/gi;
+  let m;
+  while ((m = figRe.exec(html)) && figures.length < max) {
+    const block = m[1];
+    const img = block.match(/<img[^>]*src=["']([^"']+)["']/i);
+    if (!img || /^data:/i.test(img[1])) continue;
+    let src;
+    try { src = new URL(img[1], base).href; } catch (_) { continue; }
+    if (!/^https:\/\//.test(src) || !/\.(png|jpe?g|gif|svg|webp)(\?|$)/i.test(src)) continue;
+    const capM = block.match(/<figcaption[^>]*>([\s\S]*?)<\/figcaption>/i);
+    const caption = capM ? compactText(capM[1].replace(/<[^>]+>/g, " ")).slice(0, 200) : "";
+    if (!figures.some((f) => f.src === src)) figures.push({ src, caption });
+  }
+  return figures;
+}
+
+export async function fetchPaperFigures(arxivIdOrUrl, max = 4) {
+  const id = normId(String(arxivIdOrUrl || ""));
+  if (!/^\d{4}\.\d{4,5}$/.test(id)) return [];
+  const got = await fetchArxivHtml(id);
+  return got ? extractFigures(got.html, got.base, max) : [];
 }

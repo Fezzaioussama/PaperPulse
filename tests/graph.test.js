@@ -79,8 +79,14 @@ const ARXIV_XML = `<?xml version="1.0"?>
 test("research graph runs end to end with a stubbed model and arXiv feed", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
-    assert.ok(String(url).startsWith("https://export.arxiv.org/"));
-    return { ok: true, text: async () => ARXIV_XML };
+    const u = String(url);
+    if (u.startsWith("https://export.arxiv.org/")) return { ok: true, text: async () => ARXIV_XML };
+    // collect_figures probes paper HTML pages; serve one figure for paper 1.
+    if (u.includes("/html/2401.00001")) {
+      return { ok: true, text: async () => '<body><article><figure><img src="x1.png"/><figcaption>Fig 1: scaling curve</figcaption></figure></article></body>' };
+    }
+    if (u.includes("/html/")) return { ok: false, status: 404, text: async () => "" };
+    throw new Error(`unexpected fetch: ${u}`);
   };
   // The analysis passes run in parallel, so canned replies are routed by a
   // distinctive substring of each node's prompt instead of by call order.
@@ -126,11 +132,16 @@ test("research graph runs end to end with a stubbed model and arXiv feed", async
     assert.ok(final.report.startsWith("# Briefing (revised)"));
     assert.ok(final.report.includes("[1][2]"));
     assert.ok(!final.report.includes("[7]")); // out-of-range citation stripped
+    // Figures were scraped for paper 1 from its stubbed HTML page.
+    assert.equal(final.figures.length, 1);
+    assert.equal(final.figures[0].paperId, "2401.00001");
+    assert.match(final.figures[0].figures[0].src, /\/html\/2401\.00001\/x1\.png$/);
+    assert.equal(final.figures[0].figures[0].caption, "Fig 1: scaling curve");
     const phases = events.filter((e) => e.type === "phase").map((e) => e.phase);
     assert.deepEqual(phases.slice(0, 5), ["plan", "search", "grade", "extract", "regroup"]);
-    // The four analysis passes run in parallel: order among them is not fixed.
-    assert.deepEqual([...phases.slice(5, 9)].sort(), ["challenge", "compare", "practice", "understand"]);
-    assert.deepEqual(phases.slice(9), ["synthesize", "review", "revise"]);
+    // The five parallel passes: order among them is not fixed.
+    assert.deepEqual([...phases.slice(5, 10)].sort(), ["challenge", "compare", "figures", "practice", "understand"]);
+    assert.deepEqual(phases.slice(10), ["synthesize", "review", "revise"]);
     assert.ok(events.some((e) => e.type === "papers" && e.papers.length === 2));
     assert.ok(events.some((e) => e.type === "idea_progress" && e.done === 2 && e.total === 2));
     // Partial snapshots stream out for client-side salvage.

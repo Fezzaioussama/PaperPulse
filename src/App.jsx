@@ -1892,7 +1892,7 @@ function ChatModal({ paper, onClose }) {
 
 // ── Research agent UI ──
 
-function AgentPaperRow({ paper, index, onChat }) {
+function AgentPaperRow({ paper, index, figures, onChat }) {
   return (
     <div className="agent-paper-row" style={{ animationDelay: `${(index % 8) * 45}ms` }}>
       <span className="agent-paper-index">[{index + 1}]</span>
@@ -1903,11 +1903,179 @@ function AgentPaperRow({ paper, index, onChat }) {
           {paper.categories?.length ? ` · ${paper.categories.slice(0, 3).join(", ")}` : ""}
         </div>
         {paper.reason && <div className="agent-paper-reason">{paper.reason}</div>}
+        {figures?.length > 0 && (
+          <div className="agent-paper-figs">
+            {figures.map((f, i) => (
+              <a key={i} href={f.src} target="_blank" rel="noreferrer" title={f.caption || "Open figure"}>
+                <img src={f.src} alt={f.caption || `Figure from ${paper.title}`} loading="lazy" />
+              </a>
+            ))}
+          </div>
+        )}
       </div>
       <div className="agent-paper-side">
         <span className="relevance-badge" title="LLM-judged relevance to your topic">{paper.relevance ?? "—"}</span>
         <button type="button" className="ghost-btn" onClick={() => onChat(paper)}>Chat</button>
       </div>
+    </div>
+  );
+}
+
+// ── Knowledge graph: papers ↔ themes ↔ concepts as a tri-column node-link
+//    diagram. Identity is categorical (3 validated hues via --viz-* tokens);
+//    labels wear ink tokens; hover dims everything not connected. ──
+const VIZ_KINDS = [
+  { kind: "paper", label: "Paper", color: "var(--viz-paper)" },
+  { kind: "theme", label: "Theme", color: "var(--viz-theme)" },
+  { kind: "concept", label: "Concept", color: "var(--viz-concept)" },
+];
+const vizColor = (kind) => VIZ_KINDS.find(k => k.kind === kind)?.color || "var(--viz-paper)";
+
+function KnowledgeGraph({ run, onChatPaper }) {
+  const [hover, setHover] = useState(null);
+  const papers = (run.papers || []).slice(0, 16);
+  const keyOf = agentPaperKey;
+  const paperIndex = new Map(papers.map((p, i) => [keyOf(p), i]));
+
+  const paperNodes = papers.map((p, i) => ({
+    id: `p:${keyOf(p)}`, kind: "paper", label: `[${i + 1}] ${clipText(p.title, 34)}`, ref: p,
+  }));
+  const themeNodes = (run.themes || []).slice(0, 8).map((t, i) => ({
+    id: `t:${i}`, kind: "theme", label: clipText(t.name, 30), paperIds: t.paperIds || [],
+  }));
+  const conceptNodes = (run.concepts || []).slice(0, 8).map((c, i) => ({
+    id: `c:${i}`, kind: "concept", label: clipText(c.name, 26), paperIds: c.paperIds || [],
+  }));
+  if (!paperNodes.length || (!themeNodes.length && !conceptNodes.length)) return null;
+
+  const edges = [];
+  for (const n of [...themeNodes, ...conceptNodes]) {
+    for (const id of n.paperIds) {
+      if (paperIndex.has(id)) edges.push({ from: n.id, to: `p:${id}` });
+    }
+  }
+
+  // Deterministic tri-column layout (concepts | themes | papers).
+  const W = 960;
+  const hasConcepts = conceptNodes.length > 0;
+  const cols = hasConcepts
+    ? { concept: 170, theme: W / 2, paper: W - 190 }
+    : { theme: 170, paper: W - 190 };
+  const rows = Math.max(paperNodes.length, themeNodes.length, conceptNodes.length);
+  const H = Math.max(240, rows * 42 + 40);
+  const place = (nodes) => {
+    const step = H / (nodes.length + 1);
+    nodes.forEach((n, i) => { n.x = cols[n.kind]; n.y = step * (i + 1); });
+  };
+  place(paperNodes); place(themeNodes); if (hasConcepts) place(conceptNodes);
+  const byId = new Map([...paperNodes, ...themeNodes, ...conceptNodes].map(n => [n.id, n]));
+
+  const connected = new Set();
+  if (hover) {
+    connected.add(hover);
+    for (const e of edges) {
+      if (e.from === hover) connected.add(e.to);
+      if (e.to === hover) connected.add(e.from);
+    }
+  }
+  const dimmed = (id) => hover && !connected.has(id);
+
+  return (
+    <div className="viz-wrap">
+      <div className="viz-legend" aria-hidden="true">
+        {VIZ_KINDS.filter(k => k.kind !== "concept" || hasConcepts).map(k => (
+          <span key={k.kind} className="viz-legend-item">
+            <span className="viz-dot" style={{ background: k.color }} />{k.label}
+          </span>
+        ))}
+      </div>
+      <svg
+        className="viz-graph"
+        viewBox={`0 0 ${W} ${H}`}
+        role="img"
+        aria-label="Knowledge graph linking papers, themes, and concepts"
+      >
+        {edges.map((e, i) => {
+          const a = byId.get(e.from); const b = byId.get(e.to);
+          const on = hover && (e.from === hover || e.to === hover);
+          const midX = (a.x + b.x) / 2;
+          return (
+            <path
+              key={i}
+              d={`M ${a.x + 10} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x - 10} ${b.y}`}
+              fill="none"
+              stroke={on ? vizColor(a.kind) : "var(--line-strong)"}
+              strokeWidth={on ? 2 : 1.25}
+              opacity={hover ? (on ? 0.9 : 0.12) : 0.5}
+            />
+          );
+        })}
+        {[...(hasConcepts ? conceptNodes : []), ...themeNodes, ...paperNodes].map(n => (
+          <g
+            key={n.id}
+            className={`viz-node${n.kind === "paper" ? " clickable" : ""}`}
+            opacity={dimmed(n.id) ? 0.22 : 1}
+            onMouseEnter={() => setHover(n.id)}
+            onMouseLeave={() => setHover(null)}
+            onClick={() => n.kind === "paper" && onChatPaper(n.ref)}
+          >
+            <title>{n.kind === "paper" ? n.ref.title : n.label}</title>
+            <circle cx={n.x} cy={n.y} r={8} fill={vizColor(n.kind)} stroke="var(--surface)" strokeWidth={2} />
+            <text
+              x={n.kind === "paper" ? n.x + 15 : n.kind === "theme" && hasConcepts ? n.x : n.x - 15}
+              y={n.kind === "theme" && hasConcepts ? n.y - 15 : n.y + 4}
+              textAnchor={n.kind === "paper" ? "start" : n.kind === "theme" && hasConcepts ? "middle" : "end"}
+              className="viz-label"
+            >
+              {n.label}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// Papers per year: one series (the title names it), thin rounded bars,
+// counts appear on hover rather than stamped on every bar.
+function roundedTopBar(x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h);
+  return `M ${x} ${y + h} L ${x} ${y + rr} Q ${x} ${y} ${x + rr} ${y} L ${x + w - rr} ${y} Q ${x + w} ${y} ${x + w} ${y + rr} L ${x + w} ${y + h} Z`;
+}
+
+function PapersByYear({ papers }) {
+  const counts = new Map();
+  for (const p of papers || []) {
+    const year = String(p.date || "").slice(0, 4);
+    if (/^\d{4}$/.test(year)) counts.set(year, (counts.get(year) || 0) + 1);
+  }
+  const years = [...counts.keys()].sort();
+  if (years.length < 2) return null;
+  const max = Math.max(...counts.values());
+  const W = Math.min(720, years.length * 72);
+  const H = 130;
+  const plotH = 86;
+  const barW = Math.min(40, (W / years.length) - 8);
+  return (
+    <div className="viz-years">
+      <div className="viz-years-title">Papers by year</div>
+      <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`Papers by year: ${years.map(y => `${y} has ${counts.get(y)}`).join(", ")}`} style={{ maxWidth: W }}>
+        {years.map((year, i) => {
+          const count = counts.get(year);
+          const h = Math.max(3, (count / max) * plotH);
+          const x = (W / years.length) * i + ((W / years.length) - barW) / 2;
+          const y = 14 + (plotH - h);
+          return (
+            <g key={year} className="viz-bar-g">
+              <title>{`${year}: ${count} paper${count === 1 ? "" : "s"}`}</title>
+              <path d={roundedTopBar(x, y, barW, h, 4)} fill="var(--viz-paper)" className="viz-bar" />
+              <text x={x + barW / 2} y={y - 5} textAnchor="middle" className="viz-bar-count">{count}</text>
+              <text x={x + barW / 2} y={H - 8} textAnchor="middle" className="viz-axis-label">{year}</text>
+            </g>
+          );
+        })}
+        <line x1={0} y1={14 + plotH + 0.5} x2={W} y2={14 + plotH + 0.5} stroke="var(--line)" strokeWidth={1} />
+      </svg>
     </div>
   );
 }
@@ -2234,6 +2402,7 @@ function ResearchPanel({ flash, onChatPaper }) {
   const shownPapers = run?.papers?.length ? run.papers : papers;
   const paperIndexById = new Map(shownPapers.map((p, i) => [agentPaperKey(p), i + 1]));
   const paperByKey = new Map(shownPapers.map(p => [agentPaperKey(p), p]));
+  const figuresByPaper = new Map((run?.figures || draft.figures || []).map(f => [f.paperId, f.figures]));
   const reportForDisplay = (run?.report || "").replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
 
   return (
@@ -2319,7 +2488,7 @@ function ResearchPanel({ flash, onChatPaper }) {
           </div>
           <div className="agent-papers">
             {shownPapers.map((p, i) => (
-              <AgentPaperRow key={agentPaperKey(p) + i} paper={p} index={i} onChat={onChatPaper} />
+              <AgentPaperRow key={agentPaperKey(p) + i} paper={p} index={i} figures={figuresByPaper.get(agentPaperKey(p))} onChat={onChatPaper} />
             ))}
           </div>
         </section>
@@ -2352,6 +2521,19 @@ function ResearchPanel({ flash, onChatPaper }) {
               </div>
             ))}
           </div>
+        </section>
+      )}
+
+      {run && (run.themes?.length > 0 || run.concepts?.length > 0) && (
+        <section className="results" aria-label="Knowledge graph">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Graph</span>
+              <p className="section-copy">The run as a graph: which papers each theme and concept draws on. Hover to trace connections; click a paper to chat with it.</p>
+            </div>
+          </div>
+          <KnowledgeGraph run={run} onChatPaper={onChatPaper} />
+          <PapersByYear papers={run.papers} />
         </section>
       )}
 
@@ -4437,6 +4619,11 @@ input:disabled, select:disabled {
   --shadow:0 1px 2px rgba(16,24,40,.05), 0 16px 44px rgba(16,24,40,.09);
   --accent-grad:linear-gradient(135deg, #3b63f3 0%, #7b5bf0 100%);
   --bg:#f6f8fd;
+  /* categorical viz hues (paper/theme/concept) — validated for CVD + contrast
+     against the light surface; dark mode gets its own validated steps. */
+  --viz-paper:#3b63f3;
+  --viz-theme:#d97706;
+  --viz-concept:#0d9488;
   accent-color:var(--accent);
   background:
     radial-gradient(1100px 520px at 88% -12%, rgba(123,91,240,.10), transparent 60%),
@@ -4458,6 +4645,9 @@ input:disabled, select:disabled {
   --focus:rgba(143,176,255,.22);
   --shadow:0 1px 2px rgba(0,0,0,.3), 0 18px 50px rgba(0,0,0,.45);
   --accent-grad:linear-gradient(135deg, #5f86ff 0%, #9a7bff 100%);
+  --viz-paper:#5b7ef7;
+  --viz-theme:#c47207;
+  --viz-concept:#0e9888;
   background:
     radial-gradient(1100px 520px at 88% -12%, rgba(122,92,240,.16), transparent 60%),
     radial-gradient(900px 460px at -8% -4%, rgba(64,116,255,.12), transparent 55%),
@@ -4560,6 +4750,46 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   line-height:1.5;
 }
 .library-textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 4px var(--focus); }
+
+/* ── visualizations: paper figures, knowledge graph, year chart ── */
+.agent-paper-figs { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+.agent-paper-figs a {
+  display:block;
+  border:1px solid var(--line);
+  border-radius:10px;
+  overflow:hidden;
+  background:var(--surface-2);
+  transition:transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.agent-paper-figs a:hover { transform:translateY(-2px); border-color:var(--line-strong); box-shadow:var(--shadow); }
+.agent-paper-figs img { display:block; height:72px; width:auto; max-width:160px; object-fit:cover; }
+.viz-wrap {
+  padding:16px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  animation:rise .4s ease both;
+}
+.viz-legend { display:flex; gap:16px; margin-bottom:10px; font-size:12.5px; color:var(--ink-2); }
+.viz-legend-item { display:inline-flex; align-items:center; gap:6px; }
+.viz-dot { width:10px; height:10px; border-radius:999px; display:inline-block; }
+.viz-graph { width:100%; height:auto; display:block; }
+.viz-node { transition:opacity .15s ease; }
+.viz-node.clickable { cursor:pointer; }
+.viz-label { font-size:12px; fill:var(--ink); }
+.viz-node.clickable:hover .viz-label { text-decoration:underline; }
+.viz-years { margin-top:16px; padding:16px; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); animation:rise .4s ease both; }
+.viz-years-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-3); margin-bottom:6px; }
+.viz-years svg { width:100%; height:auto; display:block; }
+.viz-bar { transition:filter .15s ease; }
+.viz-bar-g:hover .viz-bar { filter:brightness(1.12); }
+.viz-bar-count { font-size:11px; fill:var(--ink-2); opacity:0; transition:opacity .15s ease; }
+.viz-bar-g:hover .viz-bar-count { opacity:1; }
+.viz-axis-label { font-size:11px; fill:var(--ink-3); }
+@media (prefers-reduced-motion:no-preference) {
+  .viz-node circle { transition:r .15s ease; }
+  .viz-node:hover circle { r:10; }
+}
 .knowledge-row {
   display:flex;
   align-items:center;

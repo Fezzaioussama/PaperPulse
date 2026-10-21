@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseArxivXml, htmlToTextNode, dedupe } from "../api/_lib/arxiv.js";
+import { parseArxivXml, htmlToTextNode, dedupe, extractFigures } from "../api/_lib/arxiv.js";
 
 const TWO_ENTRY_XML = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -85,6 +85,20 @@ test("htmlToTextNode strips chrome, keeps structure, decodes entities", () => {
   assert.ok(text.includes('Models & methods are "compared" \'here\'.'));
   assert.ok(text.includes("- First point"));
   assert.ok(text.includes("- Second point"));
+});
+
+test("extractFigures resolves relative srcs and strips caption markup", () => {
+  const html = `
+    <figure><img src="x1.png" alt=""/><figcaption>Fig 1: <b>main</b> result</figcaption></figure>
+    <figure><img src="data:image/png;base64,xx"/><figcaption>inlined</figcaption></figure>
+    <figure><img src="/html/2401.00001/x2.jpg"/></figure>
+    <figure><img src="x1.png"/><figcaption>duplicate src</figcaption></figure>
+    <figure><img src="script.js"/><figcaption>not an image</figcaption></figure>`;
+  const figs = extractFigures(html, "https://arxiv.org/html/2401.00001");
+  assert.deepEqual(figs, [
+    { src: "https://arxiv.org/html/2401.00001/x1.png", caption: "Fig 1: main result" },
+    { src: "https://arxiv.org/html/2401.00001/x2.jpg", caption: "" },
+  ]);
 });
 
 test("dedupe keys on arXiv id, else lowercased title", () => {
