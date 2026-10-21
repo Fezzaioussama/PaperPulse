@@ -53,6 +53,10 @@ Reliability mechanics (all mechanical, none LLM-asserted):
 
 - **Phase A (done):** multi-source literature, verified evidence, hypothesis
   board, debate with recorded disagreement, protocols, report, Lab UI, tests.
+- **Phase A2 (done):** command-center shell — Home dashboard with launchpad,
+  real-data metrics and activity, the 3D research universe (hand-rolled canvas
+  projection, zero new deps, reduced-motion aware), Ctrl+K command palette,
+  animated mode transitions, JetBrains Mono technical type, dark default.
 - **Phase B:** ingestion upgrades — PDF drag-and-drop via a parsing service,
   DOI/GitHub import, per-paper claim linking in the reader.
 - **Phase C:** execution runner — sandboxed Python (Docker), protocol → code

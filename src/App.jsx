@@ -2355,8 +2355,10 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
   );
 }
 
-function ResearchPanel({ flash, onChatPaper }) {
+function ResearchPanel({ flash, onChatPaper, boot }) {
   const [topic, setTopic] = useState("");
+  // Prefill from the launchpad / command palette.
+  useEffect(() => { if (boot?.query) setTopic(boot.query.slice(0, 300)); }, [boot?.ts]);
   const [deep, setDeep] = useState(false);
   const [running, setRunning] = useState(false);
   const [steps, setSteps] = useState([]);           // [{phase, label, done}]
@@ -2964,8 +2966,10 @@ function ResearchPanel({ flash, onChatPaper }) {
 
 const SPRING = { type: "spring", stiffness: 420, damping: 32, mass: 0.7 };
 
-function StudioPanel({ flash }) {
+function StudioPanel({ flash, boot }) {
   const [board, setBoard] = useState(() => readStudio());
+  // Prefill the article goal from the launchpad / command palette.
+  useEffect(() => { if (boot?.query) setGoal(boot.query.slice(0, 300)); }, [boot?.ts]);
   const [savedRuns] = useState(() => readKnowledge().runs);
   const [librarySources] = useState(() => readKnowledgeSources());
   const [expandedRun, setExpandedRun] = useState("");
@@ -3595,8 +3599,10 @@ function LabPipeline({ stageStatus }) {
   );
 }
 
-function LabPanel({ flash }) {
+function LabPanel({ flash, boot }) {
   const [objective, setObjective] = useState("");
+  // Prefill from the launchpad / command palette.
+  useEffect(() => { if (boot?.query) setObjective(boot.query.slice(0, 300)); }, [boot?.ts]);
   const [deep, setDeep] = useState(false);
   const [running, setRunning] = useState(false);
   const [stageStatus, setStageStatus] = useState({});
@@ -4010,6 +4016,578 @@ function LabPanel({ flash }) {
   );
 }
 
+// ── Research command center (Home): metrics, launchpad, activity, and the
+//    research universe — a dependency-free 3D canvas of everything the user
+//    has researched. Only real stored data is shown; nothing is simulated. ──
+
+// Deterministic per-node jitter so layouts are stable across renders.
+function seededRand(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return () => {
+    h = Math.imul(h ^ (h >>> 15), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return ((h ^= h >>> 16) >>> 0) / 4294967296;
+  };
+}
+
+// Flatten the browser knowledge base into one spatial graph: each run/lab is
+// a constellation (hub + members), articles orbit a studio hub.
+function buildUniverseData() {
+  const k = readKnowledge();
+  const nodes = [];
+  const edges = [];
+  const seen = new Set();
+  const add = (n) => { if (!seen.has(n.id)) { seen.add(n.id); nodes.push(n); } return n.id; };
+  let cluster = 0;
+
+  for (const run of (k.runs || []).slice(0, 5)) {
+    const c = cluster++;
+    const hub = add({ id: `run:${run.id}`, kind: "hub", mode: "research", label: run.topic, cluster: c, size: 11, meta: `research run · ${(run.papers || []).length} papers · ${(run.finishedAt || "").slice(0, 10)}` });
+    const paperIds = new Map();
+    for (const p of (run.papers || []).slice(0, 10)) {
+      const id = add({ id: `p:${run.id}:${agentPaperKey(p)}`, kind: "paper", label: p.title, cluster: c, size: 5.5, meta: `${p.authors} · ${p.date || "n.d."}`, url: p.url });
+      paperIds.set(agentPaperKey(p), id);
+      edges.push([hub, id]);
+    }
+    (run.themes || []).slice(0, 6).forEach((t, i) => {
+      const id = add({ id: `t:${run.id}:${i}`, kind: "theme", label: t.name, cluster: c, size: 7, meta: "cross-paper theme" });
+      edges.push([hub, id]);
+      for (const pid of t.paperIds || []) if (paperIds.has(pid)) edges.push([id, paperIds.get(pid)]);
+    });
+    (run.concepts || []).slice(0, 5).forEach((cc, i) => {
+      const id = add({ id: `c:${run.id}:${i}`, kind: "concept", label: cc.name, cluster: c, size: 6, meta: "key concept" });
+      edges.push([hub, id]);
+    });
+  }
+
+  for (const lab of (k.labs || []).slice(0, 4)) {
+    const c = cluster++;
+    const hub = add({ id: `lab:${lab.id}`, kind: "hub", mode: "lab", label: lab.objective, cluster: c, size: 11, meta: `investigation · ${(lab.hypotheses || []).length} hypotheses · ${(lab.finishedAt || "").slice(0, 10)}` });
+    for (const p of (lab.papers || []).slice(0, 8)) {
+      const id = add({ id: `lp:${lab.id}:${agentPaperKey(p)}`, kind: "paper", label: p.title, cluster: c, size: 5.5, meta: `${p.authors} · ${p.date || "n.d."}`, url: p.url });
+      edges.push([hub, id]);
+    }
+    for (const h of lab.hypotheses || []) {
+      const v = lab.debate?.verdicts?.find(x => x.hypothesisId === h.id);
+      const id = add({ id: `h:${lab.id}:${h.id}`, kind: "hypothesis", label: `${h.id}: ${h.statement}`, cluster: c, size: 7.5, meta: `hypothesis · ${v ? `${v.verdict} (${v.confidence})` : "undebated"}` });
+      edges.push([hub, id]);
+    }
+  }
+
+  const articles = readArticles().slice(0, 6);
+  if (articles.length) {
+    const c = cluster++;
+    const hub = add({ id: "studio:hub", kind: "hub", mode: "studio", label: "Writing studio", cluster: c, size: 9, meta: `${articles.length} drafted articles` });
+    for (const a of articles) {
+      const id = add({ id: `a:${a.id}`, kind: "article", label: a.title, cluster: c, size: 6.5, meta: `article · ${(a.finishedAt || "").slice(0, 10)}` });
+      edges.push([hub, id]);
+    }
+  }
+
+  // Positions: constellation centers on a ring, members in a jittered sphere.
+  const centers = [];
+  for (let i = 0; i < cluster; i++) {
+    const a = (i / Math.max(cluster, 1)) * Math.PI * 2;
+    centers.push([Math.cos(a) * 170, (i % 2 ? 1 : -1) * 42, Math.sin(a) * 170]);
+  }
+  for (const n of nodes) {
+    const [cx, cy, cz] = centers[n.cluster] || [0, 0, 0];
+    if (n.kind === "hub") { n.x = cx; n.y = cy; n.z = cz; continue; }
+    const rand = seededRand(n.id);
+    const r = 55 + rand() * 55;
+    const theta = rand() * Math.PI * 2;
+    const phi = Math.acos(2 * rand() - 1);
+    n.x = cx + r * Math.sin(phi) * Math.cos(theta);
+    n.y = cy + (r * 0.75) * Math.cos(phi);
+    n.z = cz + r * Math.sin(phi) * Math.sin(theta);
+  }
+  const index = new Map(nodes.map((n, i) => [n.id, i]));
+  return { nodes, edges: edges.map(([a, b]) => [index.get(a), index.get(b)]).filter(([a, b]) => a != null && b != null) };
+}
+
+const UNIVERSE_KINDS = [
+  { kind: "paper", label: "Papers", cssVar: "--viz-paper" },
+  { kind: "theme", label: "Themes", cssVar: "--viz-theme" },
+  { kind: "concept", label: "Concepts", cssVar: "--viz-concept" },
+  { kind: "hypothesis", label: "Hypotheses", cssVar: "--accent-2" },
+  { kind: "article", label: "Articles", cssVar: "--accent" },
+];
+
+function ResearchUniverse({ theme, onOpenMode }) {
+  const canvasRef = useRef(null);
+  const [selected, setSelected] = useState(null);
+  const [hidden, setHidden] = useState({});
+  const data = useMemo(buildUniverseData, []);
+  const hiddenRef = useRef(hidden);
+  hiddenRef.current = hidden;
+  const selectedRef = useRef(null);
+  selectedRef.current = selected;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !data.nodes.length) return;
+    const ctx = canvas.getContext("2d");
+    const reduced = typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // Resolve theme tokens once per theme switch.
+    const css = getComputedStyle(canvas);
+    const colors = {
+      hub: css.getPropertyValue("--ink").trim() || "#999",
+      edge: css.getPropertyValue("--line-strong").trim() || "#888",
+      label: css.getPropertyValue("--muted").trim() || "#999",
+    };
+    for (const { kind, cssVar } of UNIVERSE_KINDS) colors[kind] = css.getPropertyValue(cssVar).trim() || "#888";
+
+    let yaw = 0.6, pitch = -0.28, zoom = 1.8, panX = 0, panY = 0;
+    let dragging = false, panning = false, moved = 0, lastX = 0, lastY = 0;
+    let hover = null;
+    let raf = 0;
+    let hits = [];
+    const F = 520; // perspective focal length
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
+    resize();
+
+    const draw = () => {
+      const rect = canvas.getBoundingClientRect();
+      const W = rect.width, H = rect.height;
+      ctx.clearRect(0, 0, W, H);
+      const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const hiddenNow = hiddenRef.current;
+      const sel = selectedRef.current;
+
+      // Project all nodes.
+      const proj = data.nodes.map((n) => {
+        if (hiddenNow[n.kind]) return null;
+        const x1 = n.x * cy - n.z * sy;
+        const z1 = n.x * sy + n.z * cy;
+        const y1 = n.y * cp - z1 * sp;
+        const z2 = n.y * sp + z1 * cp;
+        const s = (F / (F + z2 + 260)) * zoom;
+        if (s <= 0.05) return null;
+        return { x: W / 2 + x1 * s + panX, y: H / 2 + y1 * s + panY, s, z: z2, n };
+      });
+
+      // Neighbor set of the focus node (hover wins over selection).
+      const focus = hover ?? (sel ? data.nodes.findIndex(n => n.id === sel.id) : -1);
+      const linked = new Set();
+      if (focus >= 0) {
+        linked.add(focus);
+        for (const [a, b] of data.edges) {
+          if (a === focus) linked.add(b);
+          if (b === focus) linked.add(a);
+        }
+      }
+
+      // Edges (painter's order is irrelevant at these alphas).
+      for (const [a, b] of data.edges) {
+        const pa = proj[a], pb = proj[b];
+        if (!pa || !pb) continue;
+        const lit = focus >= 0 && (a === focus || b === focus);
+        ctx.strokeStyle = colors.edge;
+        ctx.globalAlpha = lit ? 0.9 : (focus >= 0 ? 0.08 : 0.3) * Math.min(1, Math.min(pa.s, pb.s));
+        ctx.lineWidth = lit ? 1.4 : 1;
+        ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // Nodes, far-to-near.
+      hits = [];
+      const order = proj.map((p, i) => p && { p, i }).filter(Boolean).sort((u, v) => v.p.z - u.p.z);
+      for (const { p, i } of order) {
+        const n = p.n;
+        const r = Math.max(2, n.size * p.s);
+        const isFocus = i === focus;
+        const dim = focus >= 0 && !linked.has(i);
+        ctx.globalAlpha = dim ? 0.18 : Math.min(1, 0.45 + p.s * 0.6);
+        const color = n.kind === "hub" ? colors.hub : colors[n.kind] || colors.hub;
+        if (isFocus) {
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 16;
+        }
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0;
+        hits.push({ x: p.x, y: p.y, r: r + 5, i });
+        if (n.kind === "hub" && !dim) {
+          ctx.globalAlpha = 0.9;
+          ctx.fillStyle = colors.label;
+          ctx.font = "600 11px Inter, sans-serif";
+          ctx.fillText(n.label.length > 36 ? `${n.label.slice(0, 34)}…` : n.label, p.x + r + 6, p.y + 3.5);
+        }
+      }
+      // Hover label for non-hub nodes.
+      if (hover >= 0 && proj[hover] && data.nodes[hover].kind !== "hub") {
+        const p = proj[hover];
+        const label = p.n.label.length > 52 ? `${p.n.label.slice(0, 50)}…` : p.n.label;
+        ctx.font = "600 11.5px Inter, sans-serif";
+        const w = ctx.measureText(label).width;
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = colors.hub;
+        ctx.fillText(label, Math.min(Math.max(8, p.x - w / 2), W - w - 8), Math.max(14, p.y - 14));
+      }
+      ctx.globalAlpha = 1;
+    };
+
+    const loop = () => {
+      if (!document.hidden) {
+        if (!dragging && !reduced && selectedRef.current == null) yaw += 0.0011;
+        draw();
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    if (reduced) draw(); // render once; interactions re-render below
+    raf = requestAnimationFrame(loop);
+    if (reduced) cancelAnimationFrame(raf);
+
+    const renderOnce = () => { if (reduced) draw(); };
+    const pick = (mx, my) => {
+      let best = -1, bestD = 1e9;
+      for (const h of hits) {
+        const d = Math.hypot(h.x - mx, h.y - my);
+        if (d <= h.r && d < bestD) { best = h.i; bestD = d; }
+      }
+      return best;
+    };
+    const pos = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    const onDown = (e) => { dragging = true; panning = e.shiftKey || e.button === 1; moved = 0; lastX = e.clientX; lastY = e.clientY; };
+    const onMove = (e) => {
+      const [mx, my] = pos(e);
+      if (dragging) {
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        moved += Math.abs(dx) + Math.abs(dy);
+        if (panning) { panX += dx; panY += dy; }
+        else { yaw += dx * 0.005; pitch = Math.max(-1.2, Math.min(1.2, pitch + dy * 0.004)); }
+        lastX = e.clientX; lastY = e.clientY;
+      } else {
+        hover = pick(mx, my);
+        canvas.style.cursor = hover >= 0 ? "pointer" : "grab";
+      }
+      renderOnce();
+    };
+    const onUp = (e) => {
+      if (dragging && moved < 6) {
+        const [mx, my] = pos(e);
+        const i = pick(mx, my);
+        setSelected(i >= 0 ? data.nodes[i] : null);
+      }
+      dragging = false; panning = false;
+      renderOnce();
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      zoom = Math.max(0.45, Math.min(2.4, zoom * (1 - e.deltaY * 0.0012)));
+      renderOnce();
+    };
+    const onLeave = () => { hover = -1; dragging = false; renderOnce(); };
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("mouseleave", onLeave);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      canvas.removeEventListener("mousedown", onDown);
+      canvas.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("mouseleave", onLeave);
+    };
+  }, [data, theme]);
+
+  if (!data.nodes.length) return null;
+
+  return (
+    <div className="universe-wrap">
+      <div className="universe-filters" role="group" aria-label="Filter node kinds">
+        {UNIVERSE_KINDS.map(({ kind, label, cssVar }) => (
+          <button
+            key={kind}
+            type="button"
+            className={`chip universe-chip${hidden[kind] ? "" : " on-soft"}`}
+            aria-pressed={!hidden[kind]}
+            onClick={() => setHidden(h => ({ ...h, [kind]: !h[kind] }))}
+          >
+            <span className="feed-dot" style={{ background: `var(${cssVar})` }} aria-hidden="true" />
+            {label}
+          </button>
+        ))}
+        <span className="hint universe-hint">drag to rotate · wheel to zoom · shift-drag to pan · click a node</span>
+      </div>
+      <canvas ref={canvasRef} className="universe-canvas" aria-label="3D graph of your research: papers, themes, concepts, hypotheses, and articles grouped by run" />
+      {selected && (
+        <div className="universe-detail" role="dialog" aria-label="Node details">
+          <div className="idea-card-top">
+            <span className={`idea-kind ${selected.kind}`}>{selected.kind}</span>
+            <button type="button" className="card-x" aria-label="Close details" onClick={() => setSelected(null)}>×</button>
+          </div>
+          <p className="idea-text">{selected.label}</p>
+          {selected.meta && <span className="idea-src">{selected.meta}</span>}
+          <div className="knowledge-actions">
+            {selected.url && (
+              <a className="ghost-btn" href={selected.url} target="_blank" rel="noreferrer">Open paper ↗</a>
+            )}
+            {selected.mode && (
+              <button type="button" className="ghost-btn" onClick={() => onOpenMode(selected.mode)}>
+                Explore in {selected.mode === "lab" ? "Lab" : selected.mode === "studio" ? "Studio" : "Research"} →
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Animated number for the stat tiles; jumps instantly under reduced motion.
+function CountUp({ value }) {
+  const [display, setDisplay] = useState(0);
+  useEffect(() => {
+    if (typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setDisplay(value);
+      return;
+    }
+    let raf;
+    const start = performance.now();
+    const tick = (t) => {
+      const k = Math.min(1, (t - start) / 700);
+      setDisplay(Math.round(value * (1 - Math.pow(1 - k, 3))));
+      if (k < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+  return <span className="stat-value">{display}</span>;
+}
+
+function HomePanel({ flash, theme, onNavigate }) {
+  const [launchText, setLaunchText] = useState("");
+
+  const stats = useMemo(() => {
+    const k = readKnowledge();
+    const runs = k.runs || [];
+    const labs = k.labs || [];
+    const articles = readArticles();
+    const paperKeys = new Set();
+    for (const r of [...runs, ...labs]) for (const p of r.papers || []) paperKeys.add(agentPaperKey(p));
+    return {
+      runs: runs.length,
+      labs: labs.length,
+      papers: paperKeys.size,
+      hypotheses: labs.reduce((n, l) => n + (l.hypotheses || []).length, 0),
+      verified: labs.reduce((n, l) => n + (l.findings || []).flatMap(f => f.claims || []).filter(c => c.verified).length, 0),
+      articles: articles.length,
+    };
+  }, []);
+
+  const activity = useMemo(() => {
+    const k = readKnowledge();
+    const items = [
+      ...(k.runs || []).map(r => ({ kind: "research", mode: "research", title: r.topic, at: r.finishedAt, meta: `${(r.papers || []).length} papers · ${(r.themes || []).length} themes${r.partial ? " · partial" : ""}` })),
+      ...(k.labs || []).map(l => ({ kind: "investigation", mode: "lab", title: l.objective, at: l.finishedAt, meta: `${(l.hypotheses || []).length} hypotheses · ${(l.protocols || []).length} protocols` })),
+      ...readArticles().map(a => ({ kind: "article", mode: "studio", title: a.title, at: a.finishedAt, meta: `${(a.sections || []).length} sections` })),
+    ];
+    return items.filter(x => x.at).sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 8);
+  }, []);
+
+  const launch = (mode) => {
+    onNavigate(mode, launchText.trim());
+    if (launchText.trim()) flash(`${mode === "lab" ? "Objective" : mode === "studio" ? "Goal" : "Topic"} prefilled — review and launch`);
+  };
+
+  const hasData = stats.runs + stats.labs + stats.articles > 0;
+
+  const TILES = [
+    ["Research runs", stats.runs], ["Investigations", stats.labs], ["Papers indexed", stats.papers],
+    ["Hypotheses", stats.hypotheses], ["Verified quotes", stats.verified], ["Articles", stats.articles],
+  ];
+
+  return (
+    <>
+      <section className="topic-panel home-panel" aria-label="Research launchpad">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Command center</span>
+            <p className="section-copy">Start an investigation, or explore everything your agents have already built.</p>
+          </div>
+          <span className="hint cmdk-hint-chip" aria-hidden="true">Ctrl K — command palette</span>
+        </div>
+        <div className="launchpad">
+          <input
+            className="custom-in launch-in"
+            placeholder="What do you want to research? e.g. KV cache compression beyond 128k context"
+            value={launchText}
+            onChange={e => setLaunchText(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && launch("lab")}
+          />
+          <div className="launch-actions">
+            <button type="button" className="run-btn primary-action" onClick={() => launch("lab")}>
+              Investigate (Lab)
+            </button>
+            <button type="button" className="run-btn" onClick={() => launch("research")}>Research run</button>
+            <button type="button" className="run-btn" onClick={() => launch("studio")}>Write an article</button>
+          </div>
+        </div>
+        <div className="stat-grid" aria-label="Research overview">
+          {TILES.map(([label, value], i) => (
+            <div key={label} className="stat-tile" style={{ animationDelay: `${i * 55}ms` }}>
+              <CountUp value={value} />
+              <span className="stat-label">{label}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {hasData && (
+        <section className="results" aria-label="Research universe">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Research universe</span>
+              <p className="section-copy">Your knowledge base as a 3D space — each constellation is a run or investigation; papers, themes, concepts, hypotheses, and articles orbit it.</p>
+            </div>
+          </div>
+          <ResearchUniverse theme={theme} onOpenMode={(m) => onNavigate(m, "")} />
+        </section>
+      )}
+
+      {activity.length > 0 && (
+        <section className="results" aria-label="Recent research activity">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Recent activity</span>
+              <p className="section-copy">What the agents produced most recently — stored artifacts, not simulated events.</p>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {activity.map((a, i) => (
+              <div key={`${a.kind}-${i}`} className="knowledge-row" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                <span className={`idea-kind ${a.kind === "article" ? "mine" : a.kind === "investigation" ? "finding" : "method"}`}>{a.kind}</span>
+                <span className="knowledge-topic">{a.title}</span>
+                <span className="knowledge-meta">{a.meta} · {(a.at || "").slice(0, 10)}</span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" onClick={() => onNavigate(a.mode, "")}>Open →</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {!hasData && (
+        <section className="empty hero-empty">
+          <strong>Your research universe is empty.</strong>
+          <span>Type a question above and launch a Lab investigation — the universe, metrics, and activity fill up from real results.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
+// ── Command palette (Ctrl/Cmd+K): navigate, launch, and open artifacts ──
+
+function CommandPalette({ open, onClose, run }) {
+  const [query, setQuery] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (open) { setQuery(""); setCursor(0); setTimeout(() => inputRef.current?.focus(), 10); }
+  }, [open]);
+
+  const commands = useMemo(() => {
+    if (!open) return [];
+    const base = [
+      { label: "Go to Command center", hint: "navigate", act: { nav: "home" } },
+      { label: "Go to Digest", hint: "navigate", act: { nav: "digest" } },
+      { label: "Go to Research", hint: "navigate", act: { nav: "research" } },
+      { label: "Go to Lab", hint: "navigate", act: { nav: "lab" } },
+      { label: "Go to Studio", hint: "navigate", act: { nav: "studio" } },
+      { label: "Toggle theme", hint: "appearance", act: { theme: true } },
+      { label: "Open settings", hint: "configure", act: { settings: true } },
+    ];
+    const k = readKnowledge();
+    for (const r of (k.runs || []).slice(0, 6)) base.push({ label: `Open run: ${r.topic}`, hint: "research", act: { nav: "research" } });
+    for (const l of (k.labs || []).slice(0, 6)) base.push({ label: `Open investigation: ${l.objective}`, hint: "lab", act: { nav: "lab" } });
+    for (const a of readArticles().slice(0, 6)) base.push({ label: `Open article: ${a.title}`, hint: "studio", act: { nav: "studio" } });
+    return base;
+  }, [open]);
+
+  const q = query.trim().toLowerCase();
+  const filtered = commands.filter(c => !q || c.label.toLowerCase().includes(q));
+  const launchers = q.length >= 3 ? [
+    { label: `Investigate: “${query.trim()}”`, hint: "lab agents", act: { nav: "lab", query: query.trim() } },
+    { label: `Research run: “${query.trim()}”`, hint: "research agent", act: { nav: "research", query: query.trim() } },
+  ] : [];
+  const items = [...launchers, ...filtered].slice(0, 12);
+  const active = Math.min(cursor, Math.max(items.length - 1, 0));
+
+  if (!open) return null;
+  return (
+    <div className="cmdk-overlay" onClick={onClose}>
+      <motion.div
+        className="cmdk"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        initial={{ opacity: 0, scale: 0.96, y: -14 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        transition={{ type: "spring", stiffness: 480, damping: 36 }}
+        onClick={e => e.stopPropagation()}
+      >
+        <input
+          ref={inputRef}
+          className="cmdk-input"
+          placeholder="Type a command, or a research question..."
+          value={query}
+          onChange={e => { setQuery(e.target.value); setCursor(0); }}
+          onKeyDown={e => {
+            if (e.key === "ArrowDown") { e.preventDefault(); setCursor(c => Math.min(c + 1, items.length - 1)); }
+            else if (e.key === "ArrowUp") { e.preventDefault(); setCursor(c => Math.max(c - 1, 0)); }
+            else if (e.key === "Enter" && items[active]) { run(items[active].act); }
+            else if (e.key === "Escape") onClose();
+          }}
+        />
+        <div className="cmdk-list" role="listbox" aria-label="Commands">
+          {items.map((c, i) => (
+            <button
+              key={c.label + i}
+              type="button"
+              role="option"
+              aria-selected={i === active}
+              className={`cmdk-item${i === active ? " on" : ""}`}
+              onMouseEnter={() => setCursor(i)}
+              onClick={() => run(c.act)}
+            >
+              <span className="cmdk-label">{c.label}</span>
+              <span className="cmdk-kbd">{c.hint}</span>
+            </button>
+          ))}
+          {items.length === 0 && <div className="cmdk-empty">No matching commands.</div>}
+        </div>
+        <div className="cmdk-foot">
+          <span className="cmdk-kbd">↑↓</span> navigate
+          <span className="cmdk-kbd">↵</span> run
+          <span className="cmdk-kbd">esc</span> close
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
 // ── Authentication gate ──
 // No user accounts exist by design: "signing in" verifies one of the two
 // existing credentials (the user's own OpenRouter key, or a private
@@ -4202,7 +4780,7 @@ export default function App() {
   const [view, setView] = useState("all"); // all | saved
 
   const [bookmarks, setBookmarks] = useState(() => getJSON(LS.bookmarks, {}));
-  const [theme, setTheme] = useState(() => getLS(LS.theme, "light"));
+  const [theme, setTheme] = useState(() => getLS(LS.theme, "dark")); // dark is the platform default
   const [showSettings, setShowSettings] = useState(false);
   const [keyInput, setKeyInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
@@ -4213,12 +4791,32 @@ export default function App() {
   const [embKeyInput, setEmbKeyInput] = useState("");
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
-  const [mode, setMode] = useState("digest"); // digest | research | studio
+  const [mode, setMode] = useState("home"); // home | digest | research | lab | studio
+  const [boot, setBoot] = useState(null);   // {query, ts} — prefill for the next panel
+  const [paletteOpen, setPaletteOpen] = useState(false);
   // The auth gate shows once per tab session; credentials themselves stay in
   // tab memory only, so a hard reload signs the user out by design.
   const [authed, setAuthed] = useState(() => {
     try { return sessionStorage.getItem(AUTH_SS) === "1"; } catch { return true; }
   });
+
+  // Global command palette shortcut.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(o => !o);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const navigateTo = useCallback((m, query = "") => {
+    if (query) setBoot({ query, ts: Date.now() });
+    setMode(m);
+    setPaletteOpen(false);
+  }, []);
 
   // restore last digest from cache (no auto-fetch — saves API credits)
   useEffect(() => {
@@ -4481,8 +5079,17 @@ export default function App() {
                 )}
                 {theme === "dark" ? "Light" : "Dark"}
               </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Command palette (Ctrl+K)"
+                aria-label="Open command palette"
+                onClick={() => setPaletteOpen(true)}
+              >
+                ⌘K
+              </button>
               <div className="mode-switch" role="tablist" aria-label="Workspace mode">
-                {[["digest", "Digest"], ["research", "Research"], ["lab", "Lab"], ["studio", "Studio"]].map(([m, label]) => (
+                {[["home", "Home"], ["digest", "Digest"], ["research", "Research"], ["lab", "Lab"], ["studio", "Studio"]].map(([m, label]) => (
                   <button
                     key={m}
                     type="button"
@@ -4566,11 +5173,20 @@ export default function App() {
           </section>
         )}
 
-        {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} />}
+        <motion.div
+          key={mode}
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, ease: "easeOut" }}
+        >
 
-        {mode === "lab" && <LabPanel flash={flash} />}
+        {mode === "home" && <HomePanel flash={flash} theme={theme} onNavigate={navigateTo} />}
 
-        {mode === "studio" && <StudioPanel flash={flash} />}
+        {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} boot={boot} />}
+
+        {mode === "lab" && <LabPanel flash={flash} boot={boot} />}
+
+        {mode === "studio" && <StudioPanel flash={flash} boot={boot} />}
 
         {mode === "digest" && <>
         <section className="topic-panel" aria-label="Briefing setup">
@@ -4736,8 +5352,21 @@ export default function App() {
           </section>
         )}
         </>}
+
+        </motion.div>
       </main>}
 
+      {authed && (
+        <CommandPalette
+          open={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          run={(act) => {
+            if (act.theme) { setTheme(t => (t === "dark" ? "light" : "dark")); setPaletteOpen(false); return; }
+            if (act.settings) { setShowSettings(true); setPaletteOpen(false); return; }
+            if (act.nav) navigateTo(act.nav, act.query || "");
+          }}
+        />
+      )}
       {chatPaper && <ChatModal key={getPaperChatId(chatPaper)} paper={chatPaper} onClose={() => setChatPaper(null)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -6514,6 +7143,156 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 /* context cards: left accent marks agent-generated context */
 .theme-card, .critique-questions, .practice-notes {
   border-left:3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ── command center (home) ── */
+.app { --font-mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+.stat-value, .paper-chip, .relevance-badge, .agent-step-count, .lab-stats span,
+.lab-feed, .cmdk-kbd, .board-col-count { font-family:var(--font-mono); }
+.launchpad { display:flex; flex-direction:column; gap:12px; }
+.launch-in {
+  width:100%;
+  font-size:15.5px;
+  padding:14px 18px;
+  border-radius:14px;
+}
+.launch-actions { display:flex; gap:10px; flex-wrap:wrap; }
+.stat-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+  gap:12px;
+  margin-top:18px;
+}
+.stat-tile {
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+  padding:14px 16px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  animation:rise .35s ease both;
+  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.stat-tile:hover { transform:translateY(-2px); box-shadow:var(--shadow); border-color:var(--line-strong); }
+.stat-value { font-size:26px; font-weight:700; color:var(--ink); line-height:1.1; font-variant-numeric:tabular-nums; }
+.stat-label {
+  font-size:10.5px;
+  font-weight:700;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+  color:var(--muted);
+}
+.cmdk-hint-chip { white-space:nowrap; align-self:flex-start; }
+
+/* research universe */
+.universe-wrap { position:relative; }
+.universe-canvas {
+  display:block;
+  width:100%;
+  height:440px;
+  border-radius:var(--radius);
+  border:1px solid var(--line);
+  background:
+    radial-gradient(640px 320px at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+    var(--surface-2);
+  cursor:grab;
+  touch-action:none;
+}
+.universe-filters { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+.universe-chip { display:inline-flex; align-items:center; gap:7px; font-size:12px; padding:5px 12px; opacity:.45; }
+.universe-chip.on-soft { opacity:1; border-color:var(--line-strong); }
+.universe-hint { margin-left:auto; }
+.universe-detail {
+  position:absolute;
+  top:58px;
+  right:12px;
+  width:min(300px, calc(100% - 24px));
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  box-shadow:var(--shadow);
+  padding:12px 13px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  animation:popIn .25s ease both;
+}
+.universe-detail .ghost-btn { text-decoration:none; }
+
+/* command palette */
+.cmdk-overlay {
+  position:fixed;
+  inset:0;
+  z-index:80;
+  background:rgba(10, 8, 24, .45);
+  backdrop-filter:blur(3px);
+  display:flex;
+  align-items:flex-start;
+  justify-content:center;
+  padding:12vh 16px 0;
+}
+.cmdk {
+  width:min(600px, 100%);
+  background:var(--surface);
+  border:1px solid var(--line-strong);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+.cmdk-input {
+  width:100%;
+  border:0;
+  border-bottom:1px solid var(--line);
+  background:transparent;
+  color:var(--ink);
+  font:inherit;
+  font-size:15px;
+  padding:15px 18px;
+}
+.cmdk-input:focus { outline:none; box-shadow:none; border-color:var(--accent); }
+.cmdk-list { max-height:330px; overflow-y:auto; padding:7px; display:flex; flex-direction:column; gap:2px; }
+.cmdk-item {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  width:100%;
+  text-align:left;
+  border:0;
+  background:transparent;
+  color:var(--ink);
+  font:inherit;
+  font-size:13.5px;
+  padding:9px 12px;
+  border-radius:9px;
+  cursor:pointer;
+}
+.cmdk-item.on { background:var(--accent-soft); }
+.cmdk-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cmdk-kbd {
+  font-size:10.5px;
+  color:var(--muted-2);
+  background:var(--surface-3);
+  border-radius:6px;
+  padding:2px 7px;
+  flex:none;
+}
+.cmdk-empty { padding:16px; font-size:13px; color:var(--muted); text-align:center; }
+.cmdk-foot {
+  display:flex;
+  gap:8px;
+  align-items:center;
+  padding:9px 14px;
+  border-top:1px solid var(--line);
+  font-size:11.5px;
+  color:var(--muted-2);
+}
+@media (max-width:640px) {
+  .universe-canvas { height:320px; }
+  .universe-hint { display:none; }
 }
 
 /* ── the lab: multi-agent investigation ── */

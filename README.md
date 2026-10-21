@@ -100,6 +100,8 @@ Override the port with `make run PORT=3000`.
 | **Article angles** | One click proposes 3–5 arguable takes the board could support — title, thesis, why now, outline, sources — each loadable into the composer |
 | **Article drafting** | A LangGraph pipeline (outline → draft each section → polish) writes a full article from your board, grounded in your grouping, with `[n]` citations into a numbered source list; audience / tone / length controls and an optional hand-written outline |
 | **Article export** | Drafts stream in live, are kept in the browser (`pb_articles`), and export as Markdown with the source list appended |
+| **Command center (Home)** | The default landing view: a research launchpad that prefills any mode, animated metric tiles computed from stored data, a recent-activity timeline of real artifacts, and the **research universe** — a dependency-free interactive 3D canvas (rotate / zoom / pan / click) of every run, investigation, paper, theme, concept, hypothesis, and article |
+| **Command palette** | Ctrl/Cmd+K anywhere: navigate modes, toggle theme, open saved runs/labs/articles, or type a question and launch it straight into the Lab or Research |
 | **The Lab** | A nine-agent investigation per objective: Director plans, Scout searches arXiv + Semantic Scholar + OpenAlex (merged, deduped, graded), Analyst extracts claims whose quotes are **mechanically verified** against fetched text, Ideator generates hypotheses with real novelty probes, Skeptic/Proponent/Arbiter debate (disagreements recorded, no forced consensus), Methodologist designs experiment protocols, Writer reports with provenance stats |
 | **Agent activity monitor** | Live pipeline view + a feed of agent and tool events — which agent is working, which tool it called, what it found |
 | **Authentication gate** | A full-page sign-in shown once per tab session: verify your own OpenRouter key (live against `/api/v1/key`) or a private deployment's access token (against `/api/agent`), or continue as guest — credentials stay in tab memory only, exactly like Settings |
@@ -289,7 +291,7 @@ simply contributes zero results — the Lab merges whatever responds.
 
 ### localStorage keys
 
-`pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
+`openrouter_model` · `pb_theme` (dark is the default) · `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
 (saved research runs, lab investigations, library sources, knowledge chat) · `pb_studio` (the idea
 board) · `pb_articles` (drafted articles) · `pb_emb_provider` /
 `pb_emb_url` / `pb_emb_model` (embeddings platform; the key itself is never
