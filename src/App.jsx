@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { motion, AnimatePresence } from "motion/react";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Topic presets → arXiv search queries. Categories (cat:cs.CL …) give far
@@ -109,6 +110,8 @@ const LS = {
   cache: "pb_cache",
   chats: "pb_paper_chats",
   knowledge: "pb_knowledge",
+  studio: "pb_studio",
+  articles: "pb_articles",
 };
 
 const TODAY = new Date().toLocaleDateString("en-US", {
@@ -194,7 +197,7 @@ const apiCall = (prompt, maxTokens = 10000) =>
 // ── research agent transport: POST /api/agent, then read SSE events. ──
 // Unlike chatCall, browser-key mode still goes through /api/agent (the
 // LangGraph graph runs server-side); the key is only forwarded to OpenRouter.
-async function agentCall({ action, topic, messages, knowledge, options, onEvent, signal }) {
+async function agentCall({ action, topic, messages, knowledge, mode, goal, materials, style, outline, options, onEvent, signal }) {
   const apiKey = getApiKey();
   const res = await fetch("/api/agent", {
     method: "POST",
@@ -205,7 +208,7 @@ async function agentCall({ action, topic, messages, knowledge, options, onEvent,
         : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
     },
     body: JSON.stringify({
-      action, topic, messages, knowledge,
+      action, topic, messages, knowledge, mode, goal, materials, style, outline,
       options: { ...(options || {}), ...(apiKey ? { model: getModel() } : {}) },
     }),
     signal,
@@ -569,6 +572,73 @@ function buildResearchMarkdown(run) {
     if (run.practice.resources?.length) L.push("", `**Resources:** ${run.practice.resources.join(", ")}`);
   }
   if (run.report) L.push("", "## Synthesis", "", run.report);
+  return L.join("\n");
+}
+
+// ── writing studio: idea board + drafted articles (pb_studio / pb_articles) ──
+const ARTICLES_LIMIT = 10;
+
+const newId = (prefix) =>
+  (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+function readStudio() {
+  const s = getJSON(LS.studio, null);
+  if (s && Array.isArray(s.groups) && s.groups.length) return s;
+  return { groups: [{ id: "group-unsorted", name: "Unsorted", items: [] }] };
+}
+const saveStudio = (board) => setJSON(LS.studio, board);
+
+function readArticles() {
+  const list = getJSON(LS.articles, []);
+  return Array.isArray(list) ? list.filter(a => a && a.id) : [];
+}
+
+function saveArticle(article) {
+  const compact = { ...article, markdown: String(article.markdown || "").slice(0, 60000) };
+  const list = [compact, ...readArticles().filter(a => a.id !== article.id)].slice(0, ARTICLES_LIMIT);
+  setJSON(LS.articles, list);
+  return list;
+}
+
+function deleteArticle(id) {
+  const list = readArticles().filter(a => a.id !== id);
+  setJSON(LS.articles, list);
+  return list;
+}
+
+// Flatten the board into the compose payload: dedupe the cards' sources into
+// a numbered list ([n] citations) and reference them by index.
+function buildComposeMaterials(groups) {
+  const sources = [];
+  const indexByKey = new Map();
+  const outGroups = groups.filter(g => (g.items || []).length).map(g => ({
+    name: g.name,
+    items: g.items.map(it => {
+      let source = 0;
+      if (it.src?.title) {
+        const key = it.src.url || it.src.title.toLowerCase();
+        if (!indexByKey.has(key) && sources.length < 40) {
+          sources.push({ title: it.src.title, kind: it.src.kind || "source", url: it.src.url || "", date: it.src.date || "" });
+          indexByKey.set(key, sources.length);
+        }
+        source = indexByKey.get(key) || 0;
+      }
+      return { text: it.text, kind: it.kind || "idea", source };
+    }),
+  }));
+  return { sources, groups: outGroups };
+}
+
+// Article + numbered sources as one markdown document (export / copy).
+function buildArticleMarkdown(article) {
+  const L = [article.markdown || ""];
+  if (article.sources?.length) {
+    L.push("", "## Sources", "");
+    article.sources.forEach((s, i) =>
+      L.push(`${i + 1}. ${s.url ? `[${s.title}](${s.url})` : s.title}${s.date ? ` — ${s.date}` : ""}`));
+  }
   return L.join("\n");
 }
 
@@ -2806,6 +2876,602 @@ function ResearchPanel({ flash, onChatPaper }) {
   );
 }
 
+// ── Writing studio: regroup ideas from different articles on a board, get
+//    article angles, and have the agent draft a full cited article. ──
+
+const SPRING = { type: "spring", stiffness: 420, damping: 32, mass: 0.7 };
+
+function StudioPanel({ flash }) {
+  const [board, setBoard] = useState(() => readStudio());
+  const [savedRuns] = useState(() => readKnowledge().runs);
+  const [librarySources] = useState(() => readKnowledgeSources());
+  const [expandedRun, setExpandedRun] = useState("");
+  const [newGroupName, setNewGroupName] = useState("");
+  const [ideaDraftGroup, setIdeaDraftGroup] = useState("");
+  const [ideaDraftText, setIdeaDraftText] = useState("");
+  const [dragId, setDragId] = useState("");
+  const [dropGroup, setDropGroup] = useState("");
+
+  const [angles, setAngles] = useState([]);
+  const [ideating, setIdeating] = useState(false);
+
+  const [goal, setGoal] = useState("");
+  const [audience, setAudience] = useState("a technically curious general reader");
+  const [tone, setTone] = useState("clear and engaging");
+  const [length, setLength] = useState("medium");
+  const [outlineText, setOutlineText] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [steps, setSteps] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [sectionProgress, setSectionProgress] = useState(null);
+  const [draftState, setDraftState] = useState({});
+  const [article, setArticle] = useState(null);
+  const [articles, setArticles] = useState(() => readArticles());
+  const [error, setError] = useState("");
+  const abortRef = useRef(null);
+  const composerRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => { saveStudio(board); }, [board]);
+
+  const cardCount = board.groups.reduce((n, g) => n + g.items.length, 0);
+  const firstGroupId = board.groups[0]?.id;
+  const firstGroupName = board.groups[0]?.name || "Unsorted";
+
+  // ── board operations ──
+  const addCard = (groupId, card) => {
+    const text = (card.text || "").trim().slice(0, 400);
+    if (!text) return false;
+    if (board.groups.some(g => g.items.some(it => it.text === text))) {
+      flash("Already on the board");
+      return false;
+    }
+    setBoard(b => ({
+      ...b,
+      groups: b.groups.map(g => g.id === groupId ? { ...g, items: [...g.items, { ...card, id: newId("card"), text }] } : g),
+    }));
+    return true;
+  };
+
+  const removeCard = (cardId) =>
+    setBoard(b => ({ ...b, groups: b.groups.map(g => ({ ...g, items: g.items.filter(it => it.id !== cardId) })) }));
+
+  const moveCard = (cardId, toGroupId) => {
+    setBoard(b => {
+      let moved = null;
+      const cleared = b.groups.map(g => {
+        const hit = g.items.find(it => it.id === cardId);
+        if (hit) moved = hit;
+        return { ...g, items: g.items.filter(it => it.id !== cardId) };
+      });
+      if (!moved) return b;
+      return { ...b, groups: cleared.map(g => g.id === toGroupId ? { ...g, items: [...g.items, moved] } : g) };
+    });
+  };
+
+  const addGroup = () => {
+    const name = newGroupName.trim().slice(0, 60);
+    if (!name) return;
+    setBoard(b => ({ ...b, groups: [...b.groups, { id: newId("group"), name, items: [] }] }));
+    setNewGroupName("");
+  };
+
+  // Removing a group keeps its cards: they fold into the first remaining group.
+  const removeGroup = (groupId) => {
+    setBoard(b => {
+      if (b.groups.length <= 1) return b;
+      const gone = b.groups.find(g => g.id === groupId);
+      const rest = b.groups.filter(g => g.id !== groupId);
+      return { ...b, groups: rest.map((g, i) => i === 0 ? { ...g, items: [...g.items, ...(gone?.items || [])] } : g) };
+    });
+  };
+
+  // ── pulling material from the knowledge base ──
+  const cardFromIdea = (run, entry, idea) => {
+    const p = (run.papers || []).find(x => agentPaperKey(x) === entry.paperId);
+    return {
+      text: idea.detail ? `${idea.claim} — ${idea.detail}` : idea.claim,
+      kind: idea.kind || "idea",
+      src: { title: entry.title, kind: "paper", url: p?.url || "", date: p?.date || "" },
+    };
+  };
+
+  const addAllFromRun = (run) => {
+    const existing = new Set(board.groups.flatMap(g => g.items.map(it => it.text)));
+    const fresh = [];
+    for (const entry of run.ideas || []) {
+      for (const idea of entry.ideas || []) {
+        const card = cardFromIdea(run, entry, idea);
+        const text = card.text.slice(0, 400);
+        if (!existing.has(text)) { existing.add(text); fresh.push({ ...card, id: newId("card"), text }); }
+      }
+    }
+    if (!fresh.length) { flash("All of this run's ideas are already on the board"); return; }
+    setBoard(b => ({ ...b, groups: b.groups.map(g => g.id === firstGroupId ? { ...g, items: [...g.items, ...fresh] } : g) }));
+    flash(`Added ${fresh.length} idea cards`);
+  };
+
+  // ── agent calls ──
+  const suggestAngles = async () => {
+    if (cardCount === 0 || ideating || drafting) return;
+    setIdeating(true); setError("");
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      await agentCall({
+        action: "compose",
+        mode: "ideate",
+        goal: (goal.trim() || "article ideas from my board").slice(0, 300),
+        materials: buildComposeMaterials(board.groups),
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (evt.type === "partial" && evt.key === "angles") setAngles(evt.value || []);
+          else if (evt.type === "result" && evt.angles) setAngles(evt.angles);
+        },
+      });
+      flash("Angles ready");
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Angle generation failed.");
+    } finally {
+      setIdeating(false);
+      abortRef.current = null;
+    }
+  };
+
+  const useAngle = (a) => {
+    setGoal(a.title);
+    setOutlineText((a.outline || []).join("\n"));
+    composerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    flash("Angle loaded into the composer");
+  };
+
+  const draftArticle = async () => {
+    const g = goal.trim().slice(0, 300);
+    if (g.length < 3 || drafting || ideating || cardCount === 0) return;
+    setDrafting(true); setError(""); setSteps([]); setLogs([]); setSectionProgress(null); setDraftState({}); setArticle(null);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const outlineLines = outlineText.split("\n")
+      .map(s => s.trim().replace(/^[-*\d.)\s]+/, ""))
+      .filter(Boolean)
+      .slice(0, 8);
+    try {
+      await agentCall({
+        action: "compose",
+        mode: "draft",
+        goal: g,
+        materials: buildComposeMaterials(board.groups),
+        style: { audience, tone, length },
+        outline: outlineLines.length ? { title: g, sections: outlineLines } : undefined,
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (evt.type === "phase") {
+            setSteps(prev => [...prev.map(s => ({ ...s, done: true })), { phase: evt.phase, label: evt.label, done: false }]);
+          } else if (evt.type === "log") {
+            setLogs(prev => [...prev.slice(-4), evt.message]);
+          } else if (evt.type === "section_progress") {
+            setSectionProgress(evt);
+          } else if (evt.type === "partial") {
+            setDraftState(d => ({ ...d, [evt.key]: evt.value }));
+          } else if (evt.type === "result" && evt.article) {
+            setArticle(evt.article);
+            setSteps(prev => prev.map(s => ({ ...s, done: true })));
+            setArticles(saveArticle(evt.article));
+            flash("Article drafted and saved");
+          }
+        },
+      });
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Draft failed.");
+    } finally {
+      setDrafting(false);
+      abortRef.current = null;
+    }
+  };
+
+  const stop = () => abortRef.current?.abort();
+
+  const exportArticle = (download) => {
+    if (!article) return;
+    const md = buildArticleMarkdown(article);
+    if (download) {
+      const blob = new Blob([md], { type: "text/markdown" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `paperpulse-article-${new Date().toISOString().slice(0, 10)}.md`;
+      a.click(); URL.revokeObjectURL(a.href);
+      flash("Article downloaded");
+    } else {
+      navigator.clipboard?.writeText(md).then(() => flash("Article copied as Markdown"), () => flash("Copy failed"));
+    }
+  };
+
+  const loadArticle = (a) => {
+    setArticle(a);
+    setGoal(a.goal || a.title || "");
+    setDraftState({}); setSteps([]); setLogs([]); setSectionProgress(null); setError("");
+    flash("Article loaded");
+  };
+
+  const previewMarkdown = article?.markdown
+    || draftState.article
+    || (draftState.sections ? draftState.sections.map(s => s.markdown).join("\n\n") : "");
+  const previewForDisplay = previewMarkdown.replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
+
+  return (
+    <>
+      <section className={`topic-panel studio-panel${ideating ? " running" : ""}`} aria-label="Idea board">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Idea board</span>
+            <p className="section-copy">Regroup ideas from different articles into your own groups — drag cards between groups, add your own — then turn the board into an article.</p>
+          </div>
+          <button
+            type="button"
+            className="run-btn primary-action"
+            onClick={suggestAngles}
+            disabled={cardCount === 0 || ideating || drafting}
+            title="Ask the agent for article angles this board could support"
+          >
+            {ideating ? "Thinking..." : "Suggest angles"}
+          </button>
+        </div>
+
+        <div className="board">
+          {board.groups.map(g => (
+            <motion.div
+              key={g.id}
+              layout
+              transition={SPRING}
+              className={`board-col${dropGroup === g.id ? " dropping" : ""}`}
+              onDragOver={e => { e.preventDefault(); setDropGroup(g.id); }}
+              onDragLeave={() => setDropGroup(d => (d === g.id ? "" : d))}
+              onDrop={e => { e.preventDefault(); if (dragId) moveCard(dragId, g.id); setDragId(""); setDropGroup(""); }}
+            >
+              <div className="board-col-head">
+                <span className="board-col-name">{g.name}</span>
+                <span className="board-col-count">{g.items.length}</span>
+                {board.groups.length > 1 && (
+                  <button type="button" className="card-x" title="Remove group (its cards move to the first group)" aria-label={`Remove group ${g.name}`} onClick={() => removeGroup(g.id)}>×</button>
+                )}
+              </div>
+              <div className="board-cards">
+                <AnimatePresence initial={false}>
+                  {g.items.map(it => (
+                    <motion.div
+                      key={it.id}
+                      layout
+                      layoutId={it.id}
+                      initial={{ opacity: 0, scale: 0.9, y: 10 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.9 }}
+                      transition={SPRING}
+                      className={`idea-card${dragId === it.id ? " dragging" : ""}`}
+                      draggable
+                      onDragStart={e => { setDragId(it.id); e.dataTransfer.effectAllowed = "move"; }}
+                      onDragEnd={() => { setDragId(""); setDropGroup(""); }}
+                    >
+                      <div className="idea-card-top">
+                        <span className={`idea-kind ${it.kind}`}>{it.kind}</span>
+                        <button type="button" className="card-x" aria-label="Remove idea" onClick={() => removeCard(it.id)}>×</button>
+                      </div>
+                      <p className="idea-text">{it.text}</p>
+                      {it.src?.title && <span className="idea-src" title={it.src.title}>{it.src.title}</span>}
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+                {g.items.length === 0 && <div className="board-empty">Drop ideas here</div>}
+              </div>
+              {ideaDraftGroup === g.id ? (
+                <div className="idea-add">
+                  <textarea
+                    className="library-textarea"
+                    rows={2}
+                    autoFocus
+                    placeholder="Your own idea..."
+                    value={ideaDraftText}
+                    onChange={e => setIdeaDraftText(e.target.value)}
+                  />
+                  <div className="knowledge-actions">
+                    <button
+                      type="button"
+                      className="run-btn"
+                      disabled={!ideaDraftText.trim()}
+                      onClick={() => { if (addCard(g.id, { text: ideaDraftText, kind: "mine" })) { setIdeaDraftText(""); setIdeaDraftGroup(""); } }}
+                    >
+                      Add
+                    </button>
+                    <button type="button" className="ghost-btn" onClick={() => { setIdeaDraftGroup(""); setIdeaDraftText(""); }}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button type="button" className="ghost-btn board-add-idea" onClick={() => { setIdeaDraftGroup(g.id); setIdeaDraftText(""); }}>+ Your idea</button>
+              )}
+            </motion.div>
+          ))}
+          <motion.div layout transition={SPRING} className="board-col new-group">
+            <input
+              className="custom-in"
+              placeholder="New group name"
+              value={newGroupName}
+              onChange={e => setNewGroupName(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && addGroup()}
+            />
+            <button type="button" className="run-btn" onClick={addGroup} disabled={!newGroupName.trim()}>Add group</button>
+          </motion.div>
+        </div>
+      </section>
+
+      {(savedRuns.length > 0 || librarySources.length > 0) && (
+        <section className="results" aria-label="Add material">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Add material</span>
+              <p className="section-copy">Pull extracted ideas and themes from your research runs and library sources onto the board. New cards land in “{firstGroupName}”.</p>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {savedRuns.map(r => (
+              <div key={r.id} className="material-run">
+                <div className="knowledge-row">
+                  <span className="knowledge-topic">{r.topic}</span>
+                  <span className="knowledge-meta">
+                    {(r.ideas || []).reduce((n, e) => n + (e.ideas || []).length, 0)} ideas · {(r.themes || []).length} themes · {(r.finishedAt || "").slice(0, 10)}
+                  </span>
+                  <div className="knowledge-actions">
+                    <button type="button" className="ghost-btn" onClick={() => addAllFromRun(r)}>Add all ideas</button>
+                    <button type="button" className="ghost-btn" onClick={() => setExpandedRun(id => (id === r.id ? "" : r.id))}>
+                      {expandedRun === r.id ? "Hide" : "Browse"}
+                    </button>
+                  </div>
+                </div>
+                {expandedRun === r.id && (
+                  <div className="material-ideas">
+                    {(r.themes || []).map((t, i) => (
+                      <div key={`t-${i}`} className="material-idea" style={{ animationDelay: `${(i % 10) * 35}ms` }}>
+                        <span className="idea-kind theme">theme</span>
+                        <span className="material-idea-text"><strong>{t.name}</strong> — {t.summary}</span>
+                        <button
+                          type="button"
+                          className="ghost-btn"
+                          aria-label={`Add theme ${t.name} to the board`}
+                          onClick={() => addCard(firstGroupId, { text: `${t.name}: ${t.summary}`, kind: "theme", src: { title: `Research: ${r.topic}`, kind: "research run" } }) && flash("Theme added")}
+                        >
+                          +
+                        </button>
+                      </div>
+                    ))}
+                    {(r.ideas || []).map(entry =>
+                      (entry.ideas || []).map((idea, j) => (
+                        <div key={`${entry.paperId}-${j}`} className="material-idea" style={{ animationDelay: `${((j + 2) % 10) * 35}ms` }}>
+                          <span className={`idea-kind ${idea.kind}`}>{idea.kind}</span>
+                          <span className="material-idea-text">{idea.claim} <em>{entry.title}</em></span>
+                          <button
+                            type="button"
+                            className="ghost-btn"
+                            aria-label="Add idea to the board"
+                            onClick={() => addCard(firstGroupId, cardFromIdea(r, entry, idea)) && flash("Idea added")}
+                          >
+                            +
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {librarySources.map(s => (
+              <div key={s.id} className="knowledge-row">
+                <span className="knowledge-topic">{s.title}</span>
+                <span className="knowledge-meta">{s.origin} · library source</span>
+                <div className="knowledge-actions">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => addCard(firstGroupId, { text: clipText(s.excerpt || s.title, 280), kind: "note", src: { title: s.title, kind: s.origin || "note" } }) && flash("Source added")}
+                  >
+                    + To board
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {angles.length > 0 && (
+        <section className="results" aria-label="Article angles">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Angles ({angles.length})</span>
+              <p className="section-copy">Arguable takes your board could support — each connects ideas across groups. Pick one to prefill the composer.</p>
+            </div>
+          </div>
+          <div className="angle-grid">
+            {angles.map((a, i) => (
+              <motion.div
+                key={`${a.title}-${i}`}
+                className="angle-card"
+                initial={{ opacity: 0, y: 16, scale: 0.97 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                transition={{ ...SPRING, delay: i * 0.07 }}
+              >
+                <div className="angle-title">{a.title}</div>
+                <p className="angle-thesis">{a.thesis}</p>
+                {a.angle && <p className="angle-why">{a.angle}</p>}
+                {a.outline?.length > 0 && (
+                  <div className="angle-outline">
+                    {a.outline.map((h, j) => <span key={j} className="paper-chip">{h}</span>)}
+                  </div>
+                )}
+                <button type="button" className="run-btn" onClick={() => useAngle(a)}>Use this angle →</button>
+              </motion.div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section ref={composerRef} className={`topic-panel studio-panel${drafting ? " running" : ""}`} aria-label="Article composer">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Write</span>
+            <p className="section-copy">The agent outlines from your board (or follows your outline), drafts section by section, then polishes the full article with [n] citations into your sources.</p>
+          </div>
+        </div>
+        <div className="controls">
+          <label className="fld compact">
+            <span className="ctl-label">Article goal / working title</span>
+            <input
+              className="custom-in"
+              placeholder="e.g. Why linear attention is finally winning"
+              value={goal}
+              disabled={drafting}
+              onChange={e => setGoal(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && draftArticle()}
+            />
+          </label>
+          <label className="fld">
+            <span className="ctl-label">Audience</span>
+            <select value={audience} disabled={drafting} onChange={e => setAudience(e.target.value)}>
+              <option value="a technically curious general reader">General readers</option>
+              <option value="practitioners who will apply this">Practitioners</option>
+              <option value="researchers familiar with the field">Researchers</option>
+            </select>
+          </label>
+          <label className="fld">
+            <span className="ctl-label">Tone</span>
+            <select value={tone} disabled={drafting} onChange={e => setTone(e.target.value)}>
+              <option value="clear and engaging">Clear & engaging</option>
+              <option value="precise and technical">Technical</option>
+              <option value="opinionated and direct">Opinionated</option>
+            </select>
+          </label>
+          <label className="fld">
+            <span className="ctl-label">Length</span>
+            <select value={length} disabled={drafting} onChange={e => setLength(e.target.value)}>
+              <option value="short">Short (~4 sections)</option>
+              <option value="medium">Medium (~6 sections)</option>
+              <option value="long">Long (~8 sections)</option>
+            </select>
+          </label>
+          {drafting ? (
+            <button type="button" className="run-btn" onClick={stop}>Stop</button>
+          ) : (
+            <button type="button" className="run-btn primary-action" onClick={draftArticle} disabled={goal.trim().length < 3 || cardCount === 0 || ideating}>
+              Draft article
+            </button>
+          )}
+        </div>
+        <label className="fld outline-fld">
+          <span className="ctl-label">Outline (optional — one section heading per line; leave empty to let the agent plan)</span>
+          <textarea
+            className="library-textarea"
+            rows={3}
+            value={outlineText}
+            disabled={drafting}
+            onChange={e => setOutlineText(e.target.value)}
+            placeholder={"The wall attention hit\nWhat changes with SSMs\nWhat to build now"}
+          />
+        </label>
+        {cardCount === 0 && <span className="hint">Add at least one idea card to the board first — the article is grounded in your board.</span>}
+
+        {(steps.length > 0 || drafting) && (
+          <div className="agent-steps" aria-label="Draft progress">
+            {steps.map((s, i) => (
+              <div key={`${s.phase}-${i}`} className={`agent-step ${s.done ? "done" : "on"}`}>
+                {!s.done && <span className="mini-spin" aria-hidden="true" />}
+                <span className="agent-step-label">{s.label}</span>
+                {!s.done && s.phase === "draft" && sectionProgress && (
+                  <span className="agent-step-count">{sectionProgress.done}/{sectionProgress.total}</span>
+                )}
+              </div>
+            ))}
+            {logs.map((m, i) => <div key={`log-${i}`} className="agent-log">{m}</div>)}
+          </div>
+        )}
+        {error && <div className="error-box" role="alert"><div>{error}</div></div>}
+      </section>
+
+      {(previewMarkdown || drafting) && (
+        <section className="results" aria-label="Article draft">
+          <div className="section-head">
+            <div>
+              <span className="section-label">{article ? "Article" : "Draft in progress"}</span>
+              <p className="section-copy">
+                {article ? `“${article.title}” — citations [n] point into the source list below.` : "Sections appear here as the agent writes them."}
+              </p>
+            </div>
+            {article && (
+              <div className="knowledge-actions">
+                <button type="button" className="ghost-btn" onClick={() => exportArticle(false)}>Copy MD</button>
+                <button type="button" className="ghost-btn" onClick={() => exportArticle(true)}>Export MD</button>
+              </div>
+            )}
+          </div>
+          {draftState.outline && !article && (
+            <div className="angle-outline outline-preview">
+              {draftState.outline.sections.map((s, i) => <span key={i} className="paper-chip">{s.heading}</span>)}
+            </div>
+          )}
+          {previewMarkdown
+            ? <div className="agent-report article-preview"><MessageContent content={previewForDisplay} /></div>
+            : <div className="board-empty">Waiting for the first section...</div>}
+          {article?.sources?.length > 0 && (
+            <div className="article-sources">
+              <strong>Sources</strong>
+              <ol>
+                {article.sources.map((s, i) => (
+                  <li key={i}>
+                    {s.url ? <a href={s.url} target="_blank" rel="noreferrer">{s.title}</a> : s.title}
+                    {s.date ? ` — ${s.date}` : ""}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </section>
+      )}
+
+      {articles.length > 0 && (
+        <section className="results" aria-label="Drafted articles">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Your articles</span>
+              <p className="section-copy">Drafts are kept in this browser (last {ARTICLES_LIMIT}).</p>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {articles.map((a, i) => (
+              <div key={a.id} className="knowledge-row" style={{ animationDelay: `${(i % 6) * 50}ms` }}>
+                <span className="knowledge-topic">{a.title}</span>
+                <span className="knowledge-meta">{(a.sections || []).length} sections · {(a.finishedAt || "").slice(0, 10)}</span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" onClick={() => loadArticle(a)}>Load</button>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => { setArticles(deleteArticle(a.id)); if (article?.id === a.id) setArticle(null); flash("Article deleted"); }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {cardCount === 0 && savedRuns.length === 0 && librarySources.length === 0 && (
+        <section className="empty hero-empty">
+          <strong>The studio turns your research into articles.</strong>
+          <span>Run the research agent first (or add library sources), then pull its ideas onto this board, regroup them into your own structure, and draft.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
 export default function App() {
   const [selected, setSelected] = useState(["LLMs"]);
   const [customTopic, setCustomTopic] = useState("");
@@ -3057,16 +3723,27 @@ export default function App() {
               >
                 {theme === "dark" ? "Light" : "Dark"}
               </button>
-              <button
-                type="button"
-                className="icon-btn"
-                title={mode === "research" ? "Back to the briefing digest" : "Open the research agent"}
-                aria-label={mode === "research" ? "Back to digest" : "Open research agent"}
-                aria-pressed={mode === "research"}
-                onClick={() => setMode(m => m === "research" ? "digest" : "research")}
-              >
-                {mode === "research" ? "Digest" : "Research"}
-              </button>
+              <div className="mode-switch" role="tablist" aria-label="Workspace mode">
+                {[["digest", "Digest"], ["research", "Research"], ["studio", "Studio"]].map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === m}
+                    className={`mode-tab${mode === m ? " on" : ""}`}
+                    onClick={() => setMode(m)}
+                  >
+                    {mode === m && (
+                      <motion.span
+                        layoutId="mode-pill"
+                        className="mode-pill"
+                        transition={{ type: "spring", stiffness: 520, damping: 38 }}
+                      />
+                    )}
+                    <span className="mode-tab-label">{label}</span>
+                  </button>
+                ))}
+              </div>
               <button
                 type="button"
                 className="icon-btn"
@@ -3131,6 +3808,8 @@ export default function App() {
         )}
 
         {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} />}
+
+        {mode === "studio" && <StudioPanel flash={flash} />}
 
         {mode === "digest" && <>
         <section className="topic-panel" aria-label="Briefing setup">
@@ -4807,5 +5486,206 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 @media (max-width:640px) {
   .agent-paper-row { flex-wrap:wrap; }
   .agent-paper-side { width:100%; justify-content:flex-end; }
+}
+
+/* ── writing studio ── */
+.mode-switch {
+  display:flex;
+  align-items:center;
+  gap:2px;
+  padding:3px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:999px;
+}
+.mode-tab {
+  position:relative;
+  border:0;
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+  font:inherit;
+  font-size:12.5px;
+  font-weight:600;
+  padding:6px 13px;
+  border-radius:999px;
+  transition:color .2s ease, transform .15s ease;
+}
+.mode-tab:hover { color:var(--ink); }
+.mode-tab:active { transform:scale(.95); }
+.mode-tab.on { color:#fff; }
+.mode-pill {
+  position:absolute;
+  inset:0;
+  border-radius:999px;
+  background:var(--accent-grad);
+  box-shadow:0 2px 10px var(--focus);
+}
+.mode-tab-label { position:relative; z-index:1; }
+
+.board {
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(235px, 1fr));
+  gap:14px;
+  margin-top:14px;
+}
+.board-col {
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  padding:12px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  min-height:150px;
+  transition:border-color .2s ease, box-shadow .2s ease, background .2s ease;
+}
+.board-col.dropping {
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px var(--focus);
+  background:var(--accent-soft);
+}
+.board-col-head { display:flex; align-items:center; gap:8px; }
+.board-col-name { font-weight:700; font-size:13.5px; color:var(--ink); }
+.board-col-count {
+  font-size:11.5px;
+  color:var(--muted);
+  background:var(--surface-3);
+  border-radius:999px;
+  padding:1px 8px;
+  font-variant-numeric:tabular-nums;
+}
+.board-col-head .card-x { margin-left:auto; }
+.board-cards { display:flex; flex-direction:column; gap:8px; flex:1; }
+.board-empty {
+  border:1.5px dashed var(--line-strong);
+  border-radius:var(--radius-sm);
+  padding:14px;
+  text-align:center;
+  color:var(--muted-2);
+  font-size:12.5px;
+}
+.idea-card {
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  padding:9px 10px;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  cursor:grab;
+  transition:box-shadow .18s ease, border-color .18s ease;
+}
+.idea-card:hover { box-shadow:var(--shadow); border-color:var(--line-strong); }
+.idea-card.dragging { opacity:.4; cursor:grabbing; }
+.idea-card-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.idea-text { margin:0; font-size:12.8px; line-height:1.45; color:var(--ink); }
+.idea-src {
+  font-size:11px;
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.idea-kind {
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:.05em;
+  text-transform:uppercase;
+  padding:2px 8px;
+  border-radius:999px;
+  background:var(--surface-3);
+  color:var(--muted);
+}
+.idea-kind.method { color:var(--viz-paper); }
+.idea-kind.finding { color:var(--viz-concept); }
+.idea-kind.claim { color:var(--accent); }
+.idea-kind.limitation, .idea-kind.theme { color:var(--viz-theme); }
+.card-x {
+  border:0;
+  background:transparent;
+  color:var(--muted-2);
+  cursor:pointer;
+  font-size:14px;
+  line-height:1;
+  padding:2px 6px;
+  border-radius:6px;
+  transition:color .15s ease, background .15s ease;
+}
+.card-x:hover { color:var(--ink); background:var(--surface-3); }
+.board-add-idea { align-self:flex-start; font-size:12px; }
+.idea-add { display:flex; flex-direction:column; gap:8px; }
+.board-col.new-group {
+  justify-content:center;
+  gap:10px;
+  border-style:dashed;
+  background:transparent;
+  min-height:110px;
+}
+.board-col.new-group .custom-in { width:100%; }
+.board-col.new-group .run-btn { align-self:flex-start; }
+
+.material-run { display:flex; flex-direction:column; }
+.material-ideas {
+  display:flex;
+  flex-direction:column;
+  gap:7px;
+  margin:8px 0 12px 14px;
+  padding-left:14px;
+  border-left:2px solid var(--line);
+  animation:fadeDown .25s ease both;
+}
+.material-idea { display:flex; align-items:center; gap:10px; font-size:12.8px; animation:rise .3s ease both; }
+.material-idea-text { flex:1; min-width:0; color:var(--ink); }
+.material-idea-text em { color:var(--muted); font-style:normal; font-size:11.5px; }
+.material-idea .ghost-btn { padding:2px 11px; flex-shrink:0; }
+
+.angle-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+  gap:14px;
+}
+.angle-card {
+  position:relative;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  padding:16px 16px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  overflow:hidden;
+  transition:box-shadow .2s ease, border-color .2s ease;
+}
+.angle-card::before {
+  content:"";
+  position:absolute;
+  inset:0 0 auto 0;
+  height:3px;
+  background:var(--accent-grad);
+}
+.angle-card:hover { box-shadow:var(--shadow); border-color:var(--line-strong); }
+.angle-title { font-weight:700; font-size:14.5px; color:var(--ink); }
+.angle-thesis { margin:0; font-size:13px; line-height:1.5; color:var(--ink); }
+.angle-why { margin:0; font-size:12px; color:var(--muted); }
+.angle-outline { display:flex; flex-wrap:wrap; gap:6px; }
+.angle-card .run-btn { align-self:flex-start; margin-top:4px; }
+.outline-preview { margin-bottom:12px; }
+.outline-fld { margin-top:10px; }
+
+.article-sources { margin-top:14px; font-size:13px; color:var(--ink); }
+.article-sources ol {
+  margin:8px 0 0;
+  padding-left:20px;
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}
+.article-sources a { color:var(--accent); }
+
+@media (max-width:720px) {
+  .board { grid-template-columns:1fr; }
+  .mode-switch { flex:1; }
+  .mode-tab { flex:1; }
 }
 `;

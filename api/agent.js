@@ -5,6 +5,9 @@ import { resolveModel, makeModel } from "./_lib/model.js";
 import {
   buildResearchGraph, buildChatGraph, buildChatSystemPrompt, resolveLimits,
 } from "./_lib/graph.js";
+import {
+  buildComposeGraph, ideateAngles, normalizeMaterials, normalizeOutline, resolveStyle, ARTICLE_LENGTHS,
+} from "./_lib/compose.js";
 
 // Without this flag Vercel buffers the whole response and SSE silently
 // degrades to one blob delivered at the end.
@@ -12,6 +15,7 @@ export const config = { supportsResponseStreaming: true };
 
 const MAX_BODY_BYTES = 1.5 * 1024 * 1024;
 const MAX_KNOWLEDGE_BYTES = 300 * 1024;
+const MAX_MATERIALS_BYTES = 200 * 1024;
 const TOPIC_MIN = 3;
 const TOPIC_MAX = 300;
 
@@ -51,8 +55,8 @@ export default async function handler(req, res) {
   }
 
   const action = body.action;
-  if (action !== "research" && action !== "chat" && action !== "ingest") {
-    return sendJson(res, 400, { error: 'action must be "research", "chat", or "ingest".' });
+  if (action !== "research" && action !== "chat" && action !== "ingest" && action !== "compose") {
+    return sendJson(res, 400, { error: 'action must be "research", "chat", "ingest", or "compose".' });
   }
 
   // ingest: fetch one source (arXiv id or safe public URL) and return its
@@ -72,11 +76,40 @@ export default async function handler(req, res) {
   let topic = "";
   let messages = [];
   let knowledge = null;
+  let composeMode = "";
+  let goal = "";
+  let materials = null;
+  let style = null;
+  let outline = null;
   if (action === "research") {
     topic = typeof body.topic === "string" ? body.topic.trim() : "";
     if (topic.length < TOPIC_MIN || topic.length > TOPIC_MAX) {
       return sendJson(res, 400, { error: `topic must be a string of ${TOPIC_MIN}-${TOPIC_MAX} characters.` });
     }
+  } else if (action === "compose") {
+    composeMode = body.mode;
+    if (composeMode !== "ideate" && composeMode !== "draft") {
+      return sendJson(res, 400, { error: 'compose mode must be "ideate" or "draft".' });
+    }
+    goal = typeof body.goal === "string" ? body.goal.trim() : "";
+    if (goal.length < TOPIC_MIN || goal.length > TOPIC_MAX) {
+      return sendJson(res, 400, { error: `goal must be a string of ${TOPIC_MIN}-${TOPIC_MAX} characters.` });
+    }
+    const rawMaterials = body.materials && typeof body.materials === "object" && !Array.isArray(body.materials)
+      ? body.materials
+      : null;
+    if (!rawMaterials) {
+      return sendJson(res, 400, { error: "compose requires a materials object (idea groups and sources)." });
+    }
+    if (JSON.stringify(rawMaterials).length > MAX_MATERIALS_BYTES) {
+      return sendJson(res, 413, { error: "materials payload is too large." });
+    }
+    materials = normalizeMaterials(rawMaterials);
+    if (!materials.groups.length && !materials.sources.length) {
+      return sendJson(res, 400, { error: "materials must include at least one idea card or source." });
+    }
+    style = resolveStyle(body.style);
+    outline = normalizeOutline(body.outline, ARTICLE_LENGTHS[style.length].maxSections);
   } else {
     messages = sanitizeMessages(body.messages);
     if (messages.length === 0) {
@@ -94,6 +127,8 @@ export default async function handler(req, res) {
   const model = makeModel({
     apiKey: access.apiKey,
     model: resolveModel(access.viaBrowserKey, body.options?.model),
+    // A polished long article can exceed the default output budget.
+    maxTokens: action === "compose" ? 8000 : 4000,
   });
 
   // ── Open the SSE stream ──
@@ -130,6 +165,34 @@ export default async function handler(req, res) {
           comparison: final.comparison,
           figures: final.figures,
           report: final.report,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        },
+      });
+    } else if (action === "compose" && composeMode === "ideate") {
+      const angles = await ideateAngles(
+        { goal, materials },
+        { configurable: { model, emit, signal: ac.signal } }
+      );
+      emit({ type: "result", angles });
+    } else if (action === "compose") {
+      const startedAt = new Date().toISOString();
+      const graph = buildComposeGraph();
+      const final = await graph.invoke(
+        { goal, style, materials, outline },
+        { configurable: { model, emit, signal: ac.signal }, signal: ac.signal, recursionLimit: 10 }
+      );
+      emit({
+        type: "result",
+        article: {
+          id: randomUUID(),
+          goal,
+          title: final.outline?.title || goal,
+          outline: final.outline,
+          sections: final.sections,
+          markdown: final.article,
+          sources: materials.sources,
+          style,
           startedAt,
           finishedAt: new Date().toISOString(),
         },

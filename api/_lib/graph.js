@@ -166,7 +166,7 @@ function paperLabelList(papers) {
   return papers.map((p, i) => `[${i + 1}] ${compactText(p.title)}`).join("\n");
 }
 
-async function callJson(model, prompt, config, maxRetry = 1) {
+export async function callJson(model, prompt, config, maxRetry = 1) {
   for (let attempt = 0; ; attempt++) {
     const res = await model.invoke(prompt, { signal: config.configurable.signal });
     const parsed = extractJson(typeof res.content === "string" ? res.content : JSON.stringify(res.content));

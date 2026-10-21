@@ -14,11 +14,18 @@ extracts their key ideas, regroups those ideas into cross-paper themes (where th
 papers agree and where they contradict), and writes a cited synthesis report.
 Each run is saved as a knowledge base you can chat with.
 
+Then move to **Studio** mode: pull the extracted ideas onto an idea board,
+regroup them into your own groups (drag cards between them, add your own
+takes), ask the agent for article **angles** the board could support, and have
+it draft a full article — outline, section-by-section drafting, polish — with
+`[n]` citations into your sources.
+
 ## Stack
 
 | Concern | Technology |
 |---|---|
 | Frontend | React 18, Vite 6 — no CSS framework, styles inlined as a JS template literal |
+| Motion | [`motion`](https://motion.dev) (the engine behind animate-ui): spring layout animations on the idea board, animated mode tabs |
 | AI | [OpenRouter](https://openrouter.ai) — any supported model |
 | Research agent | LangGraph JS (`@langchain/langgraph`) running server-side in `api/agent.js`, streamed to the UI as SSE |
 | RAG | Browser-side vector index (IndexedDB) with pluggable embeddings: a local transformers.js model (no key) or any OpenAI-compatible `/embeddings` endpoint |
@@ -88,6 +95,10 @@ Override the port with `make run PORT=3000`.
 | **Partial salvage** | Sections stream in as they finish; a failed or stopped run can be saved as a (marked) partial knowledge run |
 | **Follow-up research** | Every open question the critic raises has a "Research this →" button that seeds a new agent run |
 | **Briefing export** | Copy or download the whole research briefing (papers, themes, concepts, comparison table, critique, practice, synthesis) as Markdown |
+| **Idea board (Studio)** | Regroup ideas from different articles into your own groups: drag cards between groups with spring FLIP animations, pull ideas/themes from any saved run or library source, add your own takes |
+| **Article angles** | One click proposes 3–5 arguable takes the board could support — title, thesis, why now, outline, sources — each loadable into the composer |
+| **Article drafting** | A LangGraph pipeline (outline → draft each section → polish) writes a full article from your board, grounded in your grouping, with `[n]` citations into a numbered source list; audience / tone / length controls and an optional hand-written outline |
+| **Article export** | Drafts stream in live, are kept in the browser (`pb_articles`), and export as Markdown with the source list appended |
 | **Bookmarks** | Star papers into a Saved tab, persisted in `localStorage` |
 | **Markdown export** | Copy or download the digest |
 | **Dark mode** | Persisted across sessions |
@@ -114,7 +125,7 @@ api/
     text.js             #   pure text/scoring helpers ported from App.jsx
 tests/                  # node:test suite (npm test)
 src/
-  App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~3k lines)
+  App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~5.7k lines)
   main.jsx              # React entry point
 public/                 # favicon.svg, PWA icons, site.webmanifest
 arxiv-batch-analyzer.jsx  # legacy 3-line re-export shim → src/App.jsx
@@ -124,7 +135,7 @@ vercel.json             # build config + serverless function + SPA rewrite
 ```
 
 `src/App.jsx` is a deliberate single-file app — data fetching, ranking, every
-component, and the chat system live in one ~3,000-line module. Know that before
+component, and the chat system live in one ~5,700-line module. Know that before
 planning a change. The root `arxiv-batch-analyzer.jsx` is a compatibility shim
 for older imports and nothing references it.
 
@@ -189,6 +200,17 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   ports, and private/internal hosts (localhost, RFC-1918, link-local metadata
   addresses, `.local`/`.internal`) are refused before any request is made.
 
+- **Compose** (`{action: "compose", mode, goal, materials, style, outline}`):
+  the writing studio. `materials` is the user's idea board — numbered sources
+  plus their own grouping of idea cards (the grouping is respected, never
+  re-clustered). `mode: "ideate"` proposes 3–5 article angles in one call.
+  `mode: "draft"` runs a second LangGraph pipeline: `plan_outline` (skipped
+  when the user supplies an outline) `→ draft_sections` (one call per section,
+  each streamed as a `partial` with `section_progress` counts) `→
+  polish_article` (smooths transitions; on failure the stitched draft is kept).
+  Citations outside the source list are stripped mechanically. Hard caps: ≤40
+  sources, ≤80 cards, ≤8 sections — ≤10 LLM calls per draft.
+
 Auth matches `/api/chat` (`Authorization: Bearer <PAPERPULSE_ACCESS_TOKEN>`),
 plus one addition: a user's own key can be sent as `X-OpenRouter-Key` — the
 graph still runs server-side, and the key is only forwarded to OpenRouter.
@@ -251,7 +273,8 @@ Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
 ### localStorage keys
 
 `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
-(saved research runs, library sources, knowledge chat) · `pb_emb_provider` /
+(saved research runs, library sources, knowledge chat) · `pb_studio` (the idea
+board) · `pb_articles` (drafted articles) · `pb_emb_provider` /
 `pb_emb_url` / `pb_emb_model` (embeddings platform; the key itself is never
 stored). The vector index lives in IndexedDB as `pb_rag`. Clear them in
 DevTools → Application for a clean state.

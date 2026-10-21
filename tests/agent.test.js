@@ -64,6 +64,15 @@ test("agent endpoint enforces auth and input validation before any provider requ
       (await auth({ action: "chat", messages: [{ role: "user", content: "hi" }], knowledge: bigKnowledge })).code,
       413
     );
+
+    // compose validation
+    const okMaterials = { groups: [{ name: "g", items: [{ text: "an idea" }] }] };
+    assert.equal((await auth({ action: "compose", goal: "my article", materials: okMaterials })).code, 400); // no mode
+    assert.equal((await auth({ action: "compose", mode: "draft", goal: "ab", materials: okMaterials })).code, 400); // short goal
+    assert.equal((await auth({ action: "compose", mode: "ideate", goal: "my article" })).code, 400); // no materials
+    assert.equal((await auth({ action: "compose", mode: "draft", goal: "my article", materials: { groups: [], sources: [] } })).code, 400); // empty board
+    const bigMaterials = { groups: [{ name: "g", items: [{ text: "x".repeat(220 * 1024) }] }] };
+    assert.equal((await auth({ action: "compose", mode: "draft", goal: "my article", materials: bigMaterials })).code, 413);
     assert.equal(calls, 0);
   } finally {
     globalThis.fetch = originalFetch;
