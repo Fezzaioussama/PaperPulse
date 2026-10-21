@@ -108,6 +108,7 @@ const LS = {
   bookmarks: "pb_bookmarks",
   cache: "pb_cache",
   chats: "pb_paper_chats",
+  knowledge: "pb_knowledge",
 };
 
 const TODAY = new Date().toLocaleDateString("en-US", {
@@ -189,6 +190,165 @@ async function chatCall(messages, maxTokens = 10000) {
 // single-prompt convenience wrapper used by the per-paper summarizer
 const apiCall = (prompt, maxTokens = 10000) =>
   chatCall([{ role: "user", content: prompt }], maxTokens);
+
+// ── research agent transport: POST /api/agent, then read SSE events. ──
+// Unlike chatCall, browser-key mode still goes through /api/agent (the
+// LangGraph graph runs server-side); the key is only forwarded to OpenRouter.
+async function agentCall({ action, topic, messages, knowledge, options, onEvent, signal }) {
+  const apiKey = getApiKey();
+  const res = await fetch("/api/agent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey
+        ? { "X-OpenRouter-Key": apiKey }
+        : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
+    },
+    body: JSON.stringify({
+      action, topic, messages, knowledge,
+      options: { ...(options || {}), ...(apiKey ? { model: getModel() } : {}) },
+    }),
+    signal,
+  });
+  if (!res.ok) {
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    throw new Error(data?.error || data?.message ||
+      `Server API status ${res.status}. Enter a server access token or your own API key in Settings.`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let streamError = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop();
+    for (const frame of frames) {
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data: ")) continue; // skips ": ping" heartbeats
+        let evt = null;
+        try { evt = JSON.parse(line.slice(6)); } catch (_) { continue; }
+        if (evt.type === "error") streamError = new Error(evt.error || "Agent request failed.");
+        try { onEvent?.(evt); } catch (_) {}
+      }
+    }
+  }
+  if (streamError) throw streamError;
+}
+
+// ── knowledge base: research runs persisted in this browser (pb_knowledge) ──
+const KNOWLEDGE_RUNS_LIMIT = 10;
+
+function readKnowledge() {
+  const all = getJSON(LS.knowledge, { runs: [] });
+  return { ...all, runs: Array.isArray(all.runs) ? all.runs : [] };
+}
+
+function saveKnowledgeRun(run) {
+  const all = readKnowledge();
+  const compact = {
+    ...run,
+    papers: (run.papers || []).slice(0, 40).map(p => ({ ...p, abstract: clipText(p.abstract || "", 600) })),
+    report: String(run.report || "").slice(0, 20000),
+  };
+  const runs = [compact, ...all.runs.filter(r => r.id !== run.id)].slice(0, KNOWLEDGE_RUNS_LIMIT);
+  setJSON(LS.knowledge, { ...all, runs });
+  return runs;
+}
+
+function deleteKnowledgeRun(id) {
+  const all = readKnowledge();
+  const runs = all.runs.filter(r => r.id !== id);
+  setJSON(LS.knowledge, { ...all, runs });
+  return runs;
+}
+
+// Bounded payload sent with knowledge-chat requests (server caps at 300KB).
+function buildKnowledgePayload(runs, runIds) {
+  return {
+    runs: runs.filter(r => runIds.includes(r.id)).map(r => ({
+      topic: r.topic,
+      papers: (r.papers || []).slice(0, 40).map(p => ({
+        title: p.title, authors: p.authors, date: p.date, url: p.url,
+        relevance: p.relevance, abstract: clipText(p.abstract || "", 300),
+      })),
+      ideas: r.ideas || [],
+      themes: r.themes || [],
+      concepts: r.concepts || [],
+      critique: r.critique || null,
+      practice: r.practice || null,
+    })),
+  };
+}
+
+function readKnowledgeChat() {
+  const all = readKnowledge();
+  return Array.isArray(all.chat)
+    ? all.chat.filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-CHAT_HISTORY_LIMIT)
+    : [];
+}
+
+function saveKnowledgeChat(messages) {
+  const all = readKnowledge();
+  const clean = messages
+    .filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .slice(-CHAT_HISTORY_LIMIT)
+    .map(m => ({ role: m.role, content: m.content.slice(0, 5000) }));
+  setJSON(LS.knowledge, { ...all, chat: clean });
+}
+
+const agentPaperKey = (p) => normId(p.url) || (p.title || "").toLowerCase().slice(0, 90);
+
+// Full research briefing as one markdown document (export / copy).
+function buildResearchMarkdown(run) {
+  const cell = (s) => String(s || "").replace(/\|/g, "/");
+  const papers = run.papers || [];
+  const idx = new Map(papers.map((p, i) => [agentPaperKey(p), i + 1]));
+  const L = [`# Research briefing: ${run.topic}`, ""];
+  L.push(`_${(run.finishedAt || "").slice(0, 10)} · ${papers.length} papers${run.partial ? " · partial run" : ""}_`);
+  L.push("", "## Papers", "");
+  papers.forEach((p, i) =>
+    L.push(`${i + 1}. [${p.title}](${p.url}) — ${p.authors}, ${p.date}${p.relevance != null ? ` (relevance ${p.relevance})` : ""}`));
+  if (run.themes?.length) {
+    L.push("", "## Cross-paper themes");
+    for (const t of run.themes) {
+      L.push("", `### ${t.name}`, "", t.summary);
+      if (t.agreements?.length) L.push(`- **Agree:** ${t.agreements.join("; ")}`);
+      if (t.contradictions?.length) L.push(`- **Diverge:** ${t.contradictions.join("; ")}`);
+    }
+  }
+  if (run.concepts?.length) {
+    L.push("", "## Key concepts", "");
+    for (const c of run.concepts) L.push(`- **${c.name}** — ${c.explanation}`);
+  }
+  if (run.comparison?.length) {
+    L.push("", "## Paper comparison", "",
+      "| Paper | Approach | Contribution | Evidence | Limitation |", "|---|---|---|---|---|");
+    for (const r of run.comparison) {
+      L.push(`| [${idx.get(r.paperId) || "?"}] | ${cell(r.approach)} | ${cell(r.contribution)} | ${cell(r.evidence)} | ${cell(r.limitation)} |`);
+    }
+  }
+  if (run.critique) {
+    L.push("", "## Critical review", "");
+    for (const p of run.critique.points || []) L.push(`- **${p.kind}**${p.target ? ` (${p.target})` : ""}: ${p.point}`);
+    if (run.critique.openQuestions?.length) {
+      L.push("", "### Open questions", "");
+      for (const q of run.critique.openQuestions) L.push(`- ${q}`);
+    }
+  }
+  if (run.practice) {
+    L.push("", "## Practical guidance", "");
+    for (const r of run.practice.recommendations || [])
+      L.push(`- **When ${r.scenario || "in general"}:** ${r.approach}${r.why ? ` — ${r.why}` : ""}`);
+    if (run.practice.cautions?.length) L.push("", `**Cautions:** ${run.practice.cautions.join("; ")}`);
+    if (run.practice.resources?.length) L.push("", `**Resources:** ${run.practice.resources.join(", ")}`);
+  }
+  if (run.report) L.push("", "## Synthesis", "", run.report);
+  return L.join("\n");
+}
 
 // ── generic fetch with CORS-proxy fallbacks; returns response text ──
 async function fetchWithProxies(url) {
@@ -1508,6 +1668,582 @@ function ChatModal({ paper, onClose }) {
   );
 }
 
+// ── Research agent UI ──
+
+function AgentPaperRow({ paper, index, onChat }) {
+  return (
+    <div className="agent-paper-row" style={{ animationDelay: `${(index % 8) * 45}ms` }}>
+      <span className="agent-paper-index">[{index + 1}]</span>
+      <div className="agent-paper-main">
+        <a href={paper.url} target="_blank" rel="noreferrer" className="agent-paper-title">{paper.title}</a>
+        <div className="agent-paper-meta">
+          {paper.authors} · {paper.date}
+          {paper.categories?.length ? ` · ${paper.categories.slice(0, 3).join(", ")}` : ""}
+        </div>
+        {paper.reason && <div className="agent-paper-reason">{paper.reason}</div>}
+      </div>
+      <div className="agent-paper-side">
+        <span className="relevance-badge" title="LLM-judged relevance to your topic">{paper.relevance ?? "—"}</span>
+        <button type="button" className="ghost-btn" onClick={() => onChat(paper)}>Chat</button>
+      </div>
+    </div>
+  );
+}
+
+function KnowledgeChat({ runs, runIds, onClose }) {
+  const [messages, setMessages] = useState(() => readKnowledgeChat());
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [toolNote, setToolNote] = useState("");
+  const bodyRef = useRef(null);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, sending, toolNote]);
+
+  const send = async () => {
+    const q = input.trim();
+    if (!q || sending) return;
+    const next = [...messages, { role: "user", content: q }];
+    setMessages(next); setInput(""); setSending(true); setToolNote("");
+    try {
+      let reply = "";
+      await agentCall({
+        action: "chat",
+        messages: trimMessagesForModel(next),
+        knowledge: buildKnowledgePayload(runs, runIds),
+        onEvent: (evt) => {
+          if (evt.type === "tool") {
+            setToolNote(
+              evt.name === "search_arxiv" ? `Searching arXiv: ${evt.args?.query || "..."}`
+              : evt.name === "read_paper" ? "Reading a paper..."
+              : "Consulting the knowledge base..."
+            );
+          } else if (evt.type === "result" && evt.message) {
+            reply = evt.message;
+          }
+        },
+      });
+      const done = [...next, { role: "assistant", content: reply || "No answer produced. Try rephrasing." }];
+      setMessages(done);
+      saveKnowledgeChat(done);
+    } catch (err) {
+      setMessages([...next, { role: "assistant", content: `Something went wrong: ${err.message || "request failed"}.` }]);
+    } finally {
+      setSending(false);
+      setToolNote("");
+    }
+  };
+
+  const clearChat = () => { setMessages([]); saveKnowledgeChat([]); };
+  const selectedTopics = runs.filter(r => runIds.includes(r.id)).map(r => r.topic).join(" · ");
+
+  return (
+    <div className="chat-overlay" role="dialog" aria-modal="true" aria-label="Chat with research knowledge" onClick={onClose}>
+      <div className="chat-modal" onClick={e => e.stopPropagation()}>
+        <header className="chat-head">
+          <div className="chat-head-main">
+            <div className="chat-kicker">Chat with knowledge</div>
+            <div className="chat-title">{selectedTopics || "Saved research"}</div>
+            <div className="chat-status">
+              {(sending || toolNote) && <span className="mini-spin" aria-hidden="true" />}
+              <span>{toolNote || (sending ? "Thinking..." : `${runIds.length} research run${runIds.length === 1 ? "" : "s"} in context`)}</span>
+            </div>
+          </div>
+          <div className="chat-head-actions">
+            {messages.length > 0 && (
+              <button type="button" className="chat-clear" onClick={clearChat}>Clear</button>
+            )}
+            <button type="button" className="chat-close" aria-label="Close chat" onClick={onClose}>✕</button>
+          </div>
+        </header>
+
+        <div className="chat-body" ref={bodyRef}>
+          {messages.length === 0 && (
+            <div className="chat-intro">
+              <p className="chat-intro-lead">Ask across every paper in the selected research runs. The agent can also search arXiv and read papers when the knowledge base is not enough.</p>
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={i} className={`chat-msg ${m.role}`}>
+              <div className="chat-bubble"><MessageContent content={m.content} /></div>
+            </div>
+          ))}
+          {sending && (
+            <div className="chat-msg assistant">
+              <div className="chat-bubble typing"><span /><span /><span /></div>
+            </div>
+          )}
+        </div>
+
+        <form className="chat-input-row" onSubmit={e => { e.preventDefault(); send(); }}>
+          <input
+            className="chat-input"
+            placeholder="What do these papers disagree on?"
+            value={input}
+            disabled={sending}
+            onChange={e => setInput(e.target.value)}
+          />
+          <button type="submit" className="chat-send" disabled={sending || !input.trim()}>Send</button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function ResearchPanel({ flash, onChatPaper }) {
+  const [topic, setTopic] = useState("");
+  const [deep, setDeep] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [steps, setSteps] = useState([]);           // [{phase, label, done}]
+  const [logs, setLogs] = useState([]);
+  const [ideaProgress, setIdeaProgress] = useState(null);
+  const [papers, setPapers] = useState([]);
+  const [draft, setDraft] = useState({});   // partial results streamed before completion
+  const [run, setRun] = useState(null);
+  const [savedRuns, setSavedRuns] = useState(() => readKnowledge().runs);
+  const [selectedRunIds, setSelectedRunIds] = useState(() => readKnowledge().runs.slice(0, 1).map(r => r.id));
+  const [chatOpen, setChatOpen] = useState(false);
+  const [error, setError] = useState("");
+  const abortRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const start = async (overrideTopic) => {
+    const t = (typeof overrideTopic === "string" ? overrideTopic : topic).trim().slice(0, 300);
+    if (t.length < 3 || running) return;
+    if (typeof overrideTopic === "string") setTopic(t);
+    setRunning(true); setError(""); setSteps([]); setLogs([]); setPapers([]); setDraft({}); setRun(null); setIdeaProgress(null);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      await agentCall({
+        action: "research",
+        topic: t,
+        options: deep ? { deep: true } : undefined,
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (evt.type === "phase") {
+            setSteps(prev => [...prev.map(s => ({ ...s, done: true })), { phase: evt.phase, label: evt.label, done: false }]);
+          } else if (evt.type === "log") {
+            setLogs(prev => [...prev.slice(-4), evt.message]);
+          } else if (evt.type === "papers") {
+            setPapers(evt.papers || []);
+          } else if (evt.type === "idea_progress") {
+            setIdeaProgress(evt);
+          } else if (evt.type === "partial") {
+            setDraft(d => ({ ...d, [evt.key]: evt.value }));
+          } else if (evt.type === "result" && evt.run) {
+            setRun(evt.run);
+            setSteps(prev => prev.map(s => ({ ...s, done: true })));
+            const runs = saveKnowledgeRun(evt.run);
+            setSavedRuns(runs);
+            setSelectedRunIds([evt.run.id]);
+            flash("Research run saved to knowledge");
+          }
+        },
+      });
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Research run failed.");
+    } finally {
+      setRunning(false);
+      abortRef.current = null;
+    }
+  };
+
+  const stop = () => { abortRef.current?.abort(); };
+
+  // A failed/stopped run keeps whatever the stream delivered; save it as a
+  // (marked) partial knowledge run so nothing is lost.
+  const savePartial = () => {
+    const partialRun = {
+      id: (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `run-${Date.now()}`,
+      topic: topic.trim(),
+      partial: true,
+      papers,
+      ideas: draft.ideas || [],
+      themes: draft.themes || [],
+      concepts: draft.concepts || [],
+      critique: draft.critique || null,
+      practice: draft.practice || null,
+      comparison: draft.comparison || [],
+      report: draft.report || "",
+      finishedAt: new Date().toISOString(),
+    };
+    const runs = saveKnowledgeRun(partialRun);
+    setSavedRuns(runs);
+    setSelectedRunIds([partialRun.id]);
+    setRun(partialRun);
+    setError("");
+    flash("Partial research saved to knowledge");
+  };
+
+  const exportRun = (download) => {
+    if (!run) return;
+    const md = buildResearchMarkdown(run);
+    if (download) {
+      const blob = new Blob([md], { type: "text/markdown" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `paperpulse-research-${new Date().toISOString().slice(0, 10)}.md`;
+      a.click(); URL.revokeObjectURL(a.href);
+      flash("Briefing downloaded");
+    } else {
+      navigator.clipboard?.writeText(md).then(() => flash("Briefing copied as Markdown"), () => flash("Copy failed"));
+    }
+  };
+
+  const removeRun = (id) => {
+    const runs = deleteKnowledgeRun(id);
+    setSavedRuns(runs);
+    setSelectedRunIds(ids => ids.filter(x => x !== id));
+    if (run?.id === id) setRun(null);
+    flash("Research run deleted");
+  };
+
+  const toggleRunSelected = (id) => {
+    setSelectedRunIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
+  };
+
+  const loadRun = (r) => {
+    setRun(r);
+    setPapers((r.papers || []).map(p => ({ id: agentPaperKey(p), ...p })));
+    setTopic(r.topic || "");
+    setSteps([]); setLogs([]); setIdeaProgress(null); setError("");
+  };
+
+  const shownPapers = run?.papers?.length ? run.papers : papers;
+  const paperIndexById = new Map(shownPapers.map((p, i) => [agentPaperKey(p), i + 1]));
+  const paperByKey = new Map(shownPapers.map(p => [agentPaperKey(p), p]));
+  const reportForDisplay = (run?.report || "").replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
+
+  return (
+    <>
+      <section className={`topic-panel research-panel${running ? " running" : ""}`} aria-label="Research agent">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Research agent</span>
+            <p className="section-copy">An agent plans arXiv queries, keeps only relevant papers, extracts their key ideas, and regroups them into cross-paper themes.</p>
+          </div>
+        </div>
+        <div className="controls">
+          <label className="fld compact">
+            <span className="ctl-label">Research topic</span>
+            <input
+              className="custom-in"
+              placeholder="e.g. state space models for long context"
+              value={topic}
+              disabled={running}
+              onChange={e => setTopic(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !running && start()}
+            />
+          </label>
+          <label className="toggle" title="Also read the full text of each paper before extracting ideas (slower, deeper)">
+            <input
+              type="checkbox"
+              checked={deep}
+              disabled={running}
+              onChange={e => setDeep(e.target.checked)}
+            />
+            <span>Deep read</span>
+          </label>
+          {running ? (
+            <button type="button" className="run-btn" onClick={stop}>Stop</button>
+          ) : (
+            <button type="button" className="run-btn primary-action" onClick={start} disabled={topic.trim().length < 3}>
+              Run Research
+            </button>
+          )}
+        </div>
+
+        {(steps.length > 0 || running) && (
+          <div className="agent-steps" aria-label="Agent progress">
+            {steps.map((s, i) => (
+              <div key={`${s.phase}-${i}`} className={`agent-step ${s.done ? "done" : "on"}`}>
+                {!s.done && <span className="mini-spin" aria-hidden="true" />}
+                <span className="agent-step-label">{s.label}</span>
+                {!s.done && s.phase === "extract" && ideaProgress && (
+                  <span className="agent-step-count">{ideaProgress.done}/{ideaProgress.total}</span>
+                )}
+              </div>
+            ))}
+            {logs.map((msg, i) => <div key={`log-${i}`} className="agent-log">{msg}</div>)}
+          </div>
+        )}
+
+        {error && (
+          <div className="error-box" role="alert">
+            <div>{error}</div>
+            {papers.length > 0 && (
+              <button type="button" className="run-btn" onClick={savePartial}>
+                Save partial run
+              </button>
+            )}
+            {papers.length > 0 && <span className="hint">The papers found before the failure are kept below.</span>}
+          </div>
+        )}
+      </section>
+
+      {shownPapers.length > 0 && (
+        <section className="results" aria-label="Relevant papers">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Relevant papers ({shownPapers.length}){run?.partial ? " · partial run" : ""}</span>
+              <p className="section-copy">Only papers the agent judged close to the topic. Open one in chat for details.</p>
+            </div>
+            {run && (
+              <div className="knowledge-actions">
+                <button type="button" className="ghost-btn" onClick={() => exportRun(false)}>Copy MD</button>
+                <button type="button" className="ghost-btn" onClick={() => exportRun(true)}>Export MD</button>
+              </div>
+            )}
+          </div>
+          <div className="agent-papers">
+            {shownPapers.map((p, i) => (
+              <AgentPaperRow key={agentPaperKey(p) + i} paper={p} index={i} onChat={onChatPaper} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {run?.themes?.length > 0 && (
+        <section className="results" aria-label="Cross-paper themes">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Cross-paper themes</span>
+              <p className="section-copy">Ideas regrouped across papers: where they agree and where they diverge.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {run.themes.map((t, i) => (
+              <div key={i} className="theme-card" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">{t.name}</div>
+                <p className="theme-summary">{t.summary}</p>
+                {t.agreements?.length > 0 && (
+                  <div className="theme-list"><strong>Agree</strong>{t.agreements.map((a, j) => <span key={j}>{a}</span>)}</div>
+                )}
+                {t.contradictions?.length > 0 && (
+                  <div className="theme-list warn"><strong>Diverge</strong>{t.contradictions.map((c, j) => <span key={j}>{c}</span>)}</div>
+                )}
+                <div className="theme-papers">
+                  {t.paperIds.map(id => paperIndexById.get(id)
+                    ? <span key={id} className="paper-chip">[{paperIndexById.get(id)}]</span>
+                    : null)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {run?.concepts?.length > 0 && (
+        <section className="results" aria-label="Key concepts">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Understand</span>
+              <p className="section-copy">The concepts you need to follow these papers, explained plainly.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {run.concepts.map((c, i) => (
+              <div key={i} className="theme-card" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">{c.name}</div>
+                <p className="theme-summary">{c.explanation}</p>
+                <div className="theme-papers">
+                  {(c.paperIds || []).map(id => paperIndexById.get(id)
+                    ? <span key={id} className="paper-chip">[{paperIndexById.get(id)}]</span>
+                    : null)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {run?.critique && (
+        <section className="results" aria-label="Critical review">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Challenge</span>
+              <p className="section-copy">A skeptical read: weaknesses, questionable assumptions, conflicts between papers, and what remains open.</p>
+            </div>
+          </div>
+          <div className="critique-list">
+            {(run.critique.points || []).map((p, i) => (
+              <div key={i} className="critique-row" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                <span className={`critique-kind ${p.kind}`}>{p.kind}</span>
+                <div className="critique-body">
+                  {p.target && <span className="critique-target">{p.target}</span>}
+                  <span>{p.point}</span>
+                </div>
+              </div>
+            ))}
+            {(run.critique.openQuestions || []).length > 0 && (
+              <div className="critique-questions">
+                <strong>Open questions</strong>
+                <ul>
+                  {run.critique.openQuestions.map((q, i) => (
+                    <li key={i}>
+                      {q}
+                      <button
+                        type="button"
+                        className="ghost-btn follow-up"
+                        disabled={running}
+                        title="Start a new research run on this question"
+                        onClick={() => start(q)}
+                      >
+                        Research this →
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {run?.comparison?.length > 0 && (
+        <section className="results" aria-label="Paper comparison">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Compare</span>
+              <p className="section-copy">The papers side by side: approach, contribution, evidence, and sharpest limitation.</p>
+            </div>
+          </div>
+          <div className="compare-scroll">
+            <table className="compare-table">
+              <thead>
+                <tr><th>Paper</th><th>Approach</th><th>Contribution</th><th>Evidence</th><th>Limitation</th></tr>
+              </thead>
+              <tbody>
+                {run.comparison.map((r, i) => {
+                  const p = paperByKey.get(r.paperId);
+                  return (
+                    <tr key={i}>
+                      <td className="compare-paper">
+                        <span className="paper-chip">[{paperIndexById.get(r.paperId) || "?"}]</span>
+                        {p && <a href={p.url} target="_blank" rel="noreferrer">{p.title}</a>}
+                      </td>
+                      <td>{r.approach}</td>
+                      <td>{r.contribution}</td>
+                      <td>{r.evidence}</td>
+                      <td>{r.limitation}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {run?.practice && (
+        <section className="results" aria-label="Practical guidance">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Apply</span>
+              <p className="section-copy">What a practitioner should take away: which approach to use when, pitfalls, and resources the papers name.</p>
+            </div>
+          </div>
+          <div className="practice-wrap">
+            {(run.practice.recommendations || []).map((r, i) => (
+              <div key={i} className="practice-row" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                {r.scenario && <span className="practice-when">{r.scenario}</span>}
+                <span className="practice-approach">{r.approach}</span>
+                {r.why && <span className="practice-why">{r.why}</span>}
+              </div>
+            ))}
+            {(run.practice.cautions || []).length > 0 && (
+              <div className="practice-notes warn">
+                <strong>Watch out for</strong>
+                <ul>{run.practice.cautions.map((c, i) => <li key={i}>{c}</li>)}</ul>
+              </div>
+            )}
+            {(run.practice.resources || []).length > 0 && (
+              <div className="practice-notes">
+                <strong>Resources named in the papers</strong>
+                <div className="practice-resources">
+                  {run.practice.resources.map((r, i) => <span key={i} className="paper-chip">{r}</span>)}
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {run?.report && (
+        <section className="results" aria-label="Synthesis report">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Synthesis</span>
+              <p className="section-copy">What these papers collectively say about “{run.topic}”. Citations [n] point into the paper list above.</p>
+            </div>
+          </div>
+          <div className="agent-report"><MessageContent content={reportForDisplay} /></div>
+        </section>
+      )}
+
+      {savedRuns.length > 0 && (
+        <section className="results" aria-label="Knowledge base">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Knowledge base</span>
+              <p className="section-copy">Saved research runs (kept in this browser). Select runs, then chat across them.</p>
+            </div>
+            <button
+              type="button"
+              className="run-btn"
+              disabled={selectedRunIds.length === 0}
+              onClick={() => setChatOpen(true)}
+            >
+              Chat with knowledge
+            </button>
+          </div>
+          <div className="knowledge-list">
+            {savedRuns.map((r, i) => (
+              <div key={r.id} className="knowledge-row" style={{ animationDelay: `${(i % 6) * 50}ms` }}>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={selectedRunIds.includes(r.id)}
+                    onChange={() => toggleRunSelected(r.id)}
+                  />
+                  <span className="knowledge-topic">{r.topic}</span>
+                </label>
+                <span className="knowledge-meta">
+                  {(r.papers || []).length} papers · {(r.themes || []).length} themes · {(r.finishedAt || "").slice(0, 10)}
+                </span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" onClick={() => loadRun(r)}>Load</button>
+                  <button type="button" className="ghost-btn" onClick={() => removeRun(r.id)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {savedRuns.length === 0 && !running && shownPapers.length === 0 && (
+        <section className="empty hero-empty">
+          <strong>No research yet.</strong>
+          <span>Type a topic and run the agent. Each run is saved as reusable knowledge you can chat with.</span>
+        </section>
+      )}
+
+      {chatOpen && (
+        <KnowledgeChat runs={savedRuns} runIds={selectedRunIds} onClose={() => setChatOpen(false)} />
+      )}
+    </>
+  );
+}
+
 export default function App() {
   const [selected, setSelected] = useState(["LLMs"]);
   const [customTopic, setCustomTopic] = useState("");
@@ -1535,6 +2271,7 @@ export default function App() {
   const [modelInput, setModelInput] = useState(() => getModel());
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
+  const [mode, setMode] = useState("digest"); // digest | research
 
   // restore last digest from cache (no auto-fetch — saves API credits)
   useEffect(() => {
@@ -1549,7 +2286,7 @@ export default function App() {
   // theme → body + persistence
   useEffect(() => {
     try { localStorage.setItem(LS.theme, theme); } catch {}
-    document.body.style.background = theme === "dark" ? "#111111" : "#f5f7fb";
+    document.body.style.background = theme === "dark" ? "#0b0f1c" : "#f6f8fd";
   }, [theme]);
 
   useEffect(() => { setJSON(LS.bookmarks, bookmarks); }, [bookmarks]);
@@ -1750,6 +2487,16 @@ export default function App() {
               <button
                 type="button"
                 className="icon-btn"
+                title={mode === "research" ? "Back to the briefing digest" : "Open the research agent"}
+                aria-label={mode === "research" ? "Back to digest" : "Open research agent"}
+                aria-pressed={mode === "research"}
+                onClick={() => setMode(m => m === "research" ? "digest" : "research")}
+              >
+                {mode === "research" ? "Digest" : "Research"}
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
                 title="Settings"
                 aria-label="Settings"
                 aria-expanded={showSettings}
@@ -1784,6 +2531,9 @@ export default function App() {
           </section>
         )}
 
+        {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} />}
+
+        {mode === "digest" && <>
         <section className="topic-panel" aria-label="Briefing setup">
           <div className="section-head">
             <div>
@@ -1946,6 +2696,7 @@ export default function App() {
             <span>Start with a topic preset, keep HF Daily on for community signal, and run Analyze.</span>
           </section>
         )}
+        </>}
       </main>
 
       {chatPaper && <ChatModal key={getPaperChatId(chatPaper)} paper={chatPaper} onClose={() => setChatPaper(null)} />}
@@ -2984,5 +3735,414 @@ input:disabled, select:disabled {
     scroll-behavior:auto !important;
     transition-duration:.01ms !important;
   }
+}
+
+/* ── research agent ── */
+.agent-steps {
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  margin-top:14px;
+  padding:12px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:12px;
+}
+.agent-step {
+  display:flex;
+  align-items:center;
+  gap:9px;
+  font-size:13px;
+  color:var(--ink-2);
+}
+.agent-step.on { color:var(--ink); font-weight:600; }
+.agent-step.done::before {
+  content:"✓";
+  color:var(--accent);
+  font-weight:700;
+}
+.agent-step-count { color:var(--ink-3); font-variant-numeric:tabular-nums; }
+.agent-log { font-size:12px; color:var(--ink-3); padding-left:22px; }
+.agent-papers { display:flex; flex-direction:column; gap:10px; }
+.agent-paper-row {
+  display:flex;
+  gap:12px;
+  align-items:flex-start;
+  padding:12px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+}
+.agent-paper-index { color:var(--ink-3); font-size:12px; font-variant-numeric:tabular-nums; padding-top:2px; }
+.agent-paper-main { flex:1; min-width:0; }
+.agent-paper-title { font-weight:600; color:var(--ink); text-decoration:none; }
+.agent-paper-title:hover { text-decoration:underline; }
+.agent-paper-meta { font-size:12px; color:var(--ink-3); margin-top:2px; }
+.agent-paper-reason { font-size:12.5px; color:var(--ink-2); margin-top:4px; font-style:italic; }
+.agent-paper-side { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+.relevance-badge {
+  min-width:34px;
+  text-align:center;
+  padding:3px 7px;
+  border-radius:999px;
+  background:var(--chip-bg);
+  border:1px solid var(--line);
+  color:var(--accent);
+  font-size:12.5px;
+  font-weight:700;
+  font-variant-numeric:tabular-nums;
+}
+.theme-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(290px, 1fr));
+  gap:12px;
+}
+.theme-card {
+  padding:14px 16px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.theme-name { font-weight:700; color:var(--ink); }
+.theme-summary { margin:0; font-size:13.5px; color:var(--ink-2); line-height:1.5; }
+.theme-list { display:flex; flex-direction:column; gap:3px; font-size:12.5px; color:var(--ink-2); }
+.theme-list strong { color:var(--accent); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+.theme-list.warn strong { color:#b4541f; }
+.app.dark .theme-list.warn strong { color:#e0915d; }
+.theme-papers { display:flex; flex-wrap:wrap; gap:5px; margin-top:auto; }
+.paper-chip {
+  font-size:11.5px;
+  font-variant-numeric:tabular-nums;
+  padding:2px 6px;
+  border-radius:6px;
+  background:var(--chip-bg);
+  border:1px solid var(--line);
+  color:var(--ink-2);
+}
+.agent-report {
+  padding:16px 18px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+  font-size:14px;
+  line-height:1.6;
+  color:var(--ink-2);
+}
+.agent-report p { margin:0 0 10px; }
+.agent-report ul, .agent-report ol { margin:0 0 10px; padding-left:20px; }
+.critique-list { display:flex; flex-direction:column; gap:8px; }
+.critique-row {
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+  padding:10px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+  font-size:13.5px;
+  color:var(--ink-2);
+  line-height:1.5;
+}
+.critique-kind {
+  flex-shrink:0;
+  font-size:10.5px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:3px 8px;
+  border-radius:999px;
+  margin-top:1px;
+  background:var(--chip-bg);
+  border:1px solid var(--line);
+  color:var(--ink-2);
+}
+.critique-kind.conflict { color:#b4541f; }
+.critique-kind.gap { color:var(--accent); }
+.app.dark .critique-kind.conflict { color:#e0915d; }
+.critique-target { font-weight:600; color:var(--ink); margin-right:6px; }
+.critique-questions {
+  padding:12px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:12px;
+  font-size:13.5px;
+  color:var(--ink-2);
+}
+.critique-questions strong { display:block; margin-bottom:6px; color:var(--ink); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+.critique-questions ul { margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4px; }
+.practice-wrap { display:flex; flex-direction:column; gap:8px; }
+.practice-row {
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+  padding:10px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+  font-size:13.5px;
+  line-height:1.5;
+}
+.practice-when { font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--accent); }
+.practice-approach { font-weight:600; color:var(--ink); }
+.practice-why { color:var(--ink-3); }
+.practice-notes {
+  padding:12px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:12px;
+  font-size:13.5px;
+  color:var(--ink-2);
+}
+.practice-notes strong { display:block; margin-bottom:6px; color:var(--ink); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+.practice-notes.warn strong { color:#b4541f; }
+.app.dark .practice-notes.warn strong { color:#e0915d; }
+.practice-notes ul { margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4px; }
+.practice-resources { display:flex; flex-wrap:wrap; gap:6px; }
+.compare-scroll { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.compare-table { width:100%; border-collapse:collapse; font-size:13px; line-height:1.45; }
+.compare-table th, .compare-table td {
+  padding:10px 12px;
+  text-align:left;
+  vertical-align:top;
+  border-bottom:1px solid var(--line);
+  min-width:130px;
+  color:var(--ink-2);
+}
+.compare-table th {
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  color:var(--ink-3);
+  background:var(--surface-2);
+}
+.compare-table tr:last-child td { border-bottom:none; }
+.compare-paper { min-width:180px; }
+.compare-paper a { color:var(--ink); font-weight:600; text-decoration:none; margin-left:6px; }
+.compare-paper a:hover { text-decoration:underline; }
+.ghost-btn.follow-up { margin-left:8px; font-size:11.5px; padding:2px 8px; }
+
+/* ── motion layer ──
+   Everything respects the prefers-reduced-motion override at the top of the
+   media queries: animations collapse to .01ms there. */
+@keyframes popIn {
+  from { opacity:0; transform:scale(.7); }
+  to { opacity:1; transform:scale(1); }
+}
+@keyframes slideIn {
+  from { opacity:0; transform:translateX(-10px); }
+  to { opacity:1; transform:none; }
+}
+@keyframes fadeDown {
+  from { opacity:0; transform:translateY(-8px); }
+  to { opacity:1; transform:none; }
+}
+@keyframes sweep {
+  from { background-position:-200% 0; }
+  to { background-position:200% 0; }
+}
+@keyframes breathe {
+  0%, 100% { opacity:1; }
+  50% { opacity:.55; }
+}
+
+/* page + sections enter softly; streamed sections rise as they arrive */
+.masthead { animation:fadeDown .5s ease both; }
+.topic-panel, .settings, .results, .progress-wrap, .hero-empty { animation:rise .4s ease both; }
+
+/* press feedback everywhere a finger lands */
+.run-btn, .ghost-btn, .icon-btn, .chip, .tab, .tag, .chat-send { will-change:transform; }
+.run-btn:active, .ghost-btn:active, .icon-btn:active, .chip:active, .tab:active, .tag:active, .chat-send:active { transform:scale(.95); }
+
+/* digest progress bar: indeterminate shimmer over the fill */
+.bar-fill { position:relative; overflow:hidden; }
+.bar-fill::after {
+  content:"";
+  position:absolute;
+  inset:0;
+  background:linear-gradient(90deg, transparent, rgba(255,255,255,.35), transparent);
+  background-size:200% 100%;
+  animation:sweep 1.4s linear infinite;
+}
+
+/* research panel: a sweeping activity strip while the agent is working */
+.research-panel.running::after {
+  content:"";
+  display:block;
+  height:3px;
+  margin-top:14px;
+  border-radius:999px;
+  background:linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size:200% 100%;
+  animation:sweep 1.1s linear infinite;
+}
+
+/* agent timeline: steps slide in, the active one breathes, done pops a check */
+.agent-step { animation:slideIn .3s ease both; }
+.agent-log { animation:slideIn .3s ease both; }
+.agent-step.on .agent-step-label { animation:breathe 1.6s ease-in-out infinite; }
+.agent-step.done::before { animation:popIn .25s ease both; }
+
+/* streamed content rises with a stagger (delay set inline per row) */
+.agent-paper-row, .theme-card, .critique-row, .practice-row, .knowledge-row { animation:rise .35s ease both; }
+.compare-scroll, .agent-report, .critique-questions, .practice-notes { animation:rise .4s ease both; }
+.relevance-badge { animation:popIn .3s ease both; }
+.paper-chip { animation:popIn .25s ease both; }
+
+/* hover lift on the research surfaces */
+.agent-paper-row, .theme-card, .knowledge-row {
+  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.agent-paper-row:hover, .theme-card:hover, .knowledge-row:hover {
+  transform:translateY(-2px);
+  box-shadow:var(--shadow);
+  border-color:var(--line-strong);
+}
+
+/* chat: bubbles rise in, the tool-status line breathes */
+.chat-msg { animation:rise .25s ease both; }
+.chat-status { transition:opacity .2s ease; }
+.chat-status .mini-spin + span { animation:breathe 1.6s ease-in-out infinite; }
+
+/* ── modern skin ──
+   Token-level reskin: vivid indigo accent with a gradient, larger radii,
+   layered shadows, aurora page background, pill controls, Inter typography
+   (loaded in index.html). Later rules override the base styles above. */
+.app {
+  --accent:#3b63f3;
+  --accent-strong:#2c49c7;
+  --accent-soft:#e9eeff;
+  --focus:rgba(59,99,243,.18);
+  --radius:16px;
+  --radius-sm:11px;
+  --shadow:0 1px 2px rgba(16,24,40,.05), 0 16px 44px rgba(16,24,40,.09);
+  --accent-grad:linear-gradient(135deg, #3b63f3 0%, #7b5bf0 100%);
+  --bg:#f6f8fd;
+  accent-color:var(--accent);
+  background:
+    radial-gradient(1100px 520px at 88% -12%, rgba(123,91,240,.10), transparent 60%),
+    radial-gradient(900px 460px at -8% -4%, rgba(59,99,243,.09), transparent 55%),
+    var(--bg);
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+}
+.app.dark {
+  --bg:#0b0f1c;
+  --surface:#131a2c;
+  --surface-2:#182136;
+  --surface-3:#1e2a44;
+  --line:#243052;
+  --line-strong:#33426e;
+  --accent:#8fb0ff;
+  --accent-strong:#c1d4ff;
+  --accent-soft:#1c2947;
+  --focus:rgba(143,176,255,.22);
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 18px 50px rgba(0,0,0,.45);
+  --accent-grad:linear-gradient(135deg, #5f86ff 0%, #9a7bff 100%);
+  background:
+    radial-gradient(1100px 520px at 88% -12%, rgba(122,92,240,.16), transparent 60%),
+    radial-gradient(900px 460px at -8% -4%, rgba(64,116,255,.12), transparent 55%),
+    var(--bg);
+  background-attachment:fixed;
+}
+::selection { background:#3b63f3; color:#fff; }
+
+/* typography: tight display heading with a gradient wordmark */
+.brand-name {
+  letter-spacing:-0.035em;
+  background:var(--accent-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  color:transparent;
+}
+.kicker { letter-spacing:.12em; }
+.section-label::before {
+  content:"";
+  display:inline-block;
+  width:18px;
+  height:3px;
+  margin-right:8px;
+  vertical-align:3px;
+  border-radius:2px;
+  background:var(--accent-grad);
+}
+
+/* controls become pills; the primary action gets the gradient + glow */
+.icon-btn, .ghost-btn, .tab, .chip, .tag, .run-btn, .chat-send { border-radius:999px; }
+.run-btn.primary-action, .chat-send {
+  background:var(--accent-grad);
+  border-color:transparent;
+  color:#fff;
+  box-shadow:0 8px 22px rgba(59,99,243,.28);
+}
+.run-btn.primary-action:hover, .chat-send:hover {
+  color:#fff;
+  border-color:transparent;
+  transform:translateY(-1px);
+  filter:brightness(1.07);
+  box-shadow:0 11px 28px rgba(59,99,243,.36);
+}
+.run-btn.primary-action:disabled, .chat-send:disabled { filter:saturate(.4) opacity(.7); box-shadow:none; }
+.chip.on {
+  background:var(--accent-grad);
+  border-color:transparent;
+  color:#fff;
+}
+
+/* inputs: soft rounding and an accent focus ring */
+.app input:not([type="checkbox"]), .app select {
+  border-radius:12px;
+  transition:border-color .16s ease, box-shadow .16s ease;
+}
+.app input:focus, .app select:focus {
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px var(--focus);
+}
+button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+/* surfaces: hairline borders with a soft top highlight */
+.settings, .topic-panel, .progress-wrap, .hero-empty, .card, .chat-modal {
+  box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.55);
+}
+.app.dark .settings, .app.dark .topic-panel, .app.dark .progress-wrap,
+.app.dark .hero-empty, .app.dark .card, .app.dark .chat-modal {
+  box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.045);
+}
+.agent-paper-row, .theme-card, .critique-row, .practice-row, .knowledge-row,
+.agent-steps, .agent-report, .critique-questions, .practice-notes, .compare-scroll {
+  border-radius:var(--radius);
+}
+.relevance-badge { border:none; background:var(--accent-soft); color:var(--accent-strong); }
+
+/* slim modern scrollbars */
+*::-webkit-scrollbar { width:10px; height:10px; }
+*::-webkit-scrollbar-track { background:transparent; }
+*::-webkit-scrollbar-thumb {
+  background:var(--line-strong);
+  border-radius:999px;
+  border:3px solid transparent;
+  background-clip:content-box;
+}
+.knowledge-list { display:flex; flex-direction:column; gap:8px; }
+.knowledge-row {
+  display:flex;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+  padding:10px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:12px;
+}
+.knowledge-row .toggle { flex:1; min-width:180px; }
+.knowledge-topic { font-weight:600; color:var(--ink); }
+.knowledge-meta { font-size:12px; color:var(--ink-3); }
+.knowledge-actions { display:flex; gap:6px; }
+@media (max-width:640px) {
+  .agent-paper-row { flex-wrap:wrap; }
+  .agent-paper-side { width:100%; justify-content:flex-end; }
 }
 `;

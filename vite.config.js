@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import chatHandler from './api/chat.js'
+import agentHandler from './api/agent.js'
 
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
@@ -29,23 +30,29 @@ function localApiPlugin() {
   return {
     name: 'paperpulse-local-api',
     configureServer(server) {
-      server.middlewares.use('/api/chat', async (req, res) => {
-        try {
-          req.body = await readRequestBody(req)
-          res.status = (statusCode) => {
-            res.statusCode = statusCode
-            return res
-          }
+      const mount = (route, handler) => {
+        server.middlewares.use(route, async (req, res) => {
+          try {
+            req.body = await readRequestBody(req)
+            res.status = (statusCode) => {
+              res.statusCode = statusCode
+              return res
+            }
 
-          await chatHandler(req, res)
-        } catch (error) {
-          if (res.headersSent) return
-          const statusCode = error.message === 'Request body must be valid JSON.' ? 400 : 500
-          res.statusCode = statusCode
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: error.message || 'Local API request failed.' }))
-        }
-      })
+            await handler(req, res)
+          } catch (error) {
+            if (res.headersSent) return
+            const statusCode = error.message === 'Request body must be valid JSON.' ? 400 : 500
+            res.statusCode = statusCode
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({ error: error.message || 'Local API request failed.' }))
+          }
+        })
+      }
+      mount('/api/chat', chatHandler)
+      // The agent handler streams SSE by writing directly to the raw Node
+      // response, which Vite's dev server passes through unbuffered.
+      mount('/api/agent', agentHandler)
     },
   }
 }

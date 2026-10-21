@@ -1,30 +1,9 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { sendJson, sanitizeMessages, checkAccess } from "./_lib/auth.js";
 
 // Model is always taken from the server environment — never from the client.
 // This prevents a public deployment from being abused to call expensive models.
 const DEFAULT_MODEL = "deepseek/deepseek-v4-pro";
 const MAX_TOKENS_LIMIT = 10000;
-const MAX_MESSAGES = 24;
-const MAX_CONTENT_LENGTH = 12000;
-
-function sendJson(res, status, body) {
-  res.status(status).setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
-}
-
-function sanitizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
-  return messages
-    .filter(
-      (m) =>
-        m &&
-        ["system", "user", "assistant"].includes(m.role) &&
-        typeof m.content === "string" &&
-        m.content.trim().length > 0
-    )
-    .slice(-MAX_MESSAGES)
-    .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_CONTENT_LENGTH) }));
-}
 
 export default async function handler(req, res) {
   // Only allow POST
@@ -34,21 +13,11 @@ export default async function handler(req, res) {
   }
 
   res.setHeader("Cache-Control", "no-store");
-  const accessToken = process.env.PAPERPULSE_ACCESS_TOKEN;
-  if (!accessToken || accessToken.length < 32) {
-    return sendJson(res, 503, { error: "Server chat is disabled. Use your own API key in Settings." });
+  const access = checkAccess(req);
+  if (!access.ok) {
+    return sendJson(res, access.status, { error: access.error });
   }
-  const authorization = req.headers?.authorization;
-  const expected = createHash("sha256").update(`Bearer ${accessToken}`).digest();
-  const supplied = createHash("sha256").update(typeof authorization === "string" ? authorization : "").digest();
-  if (!timingSafeEqual(expected, supplied)) {
-    return sendJson(res, 401, { error: "Enter a valid server access token or your own API key in Settings." });
-  }
-
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    return sendJson(res, 500, { error: "OPENROUTER_API_KEY is not configured on the server." });
-  }
+  const apiKey = access.apiKey;
 
   let body = req.body || {};
   if (typeof body === "string") {

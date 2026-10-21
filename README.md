@@ -8,19 +8,26 @@ them, and generates a structured briefing for each: TL;DR, key points, method,
 results, impact score, and tags. Open any paper's chat to ask questions answered
 from its full text, with citations.
 
+Or switch to **Research** mode: a [LangGraph](https://langchain-ai.github.io/langgraphjs/)
+agent plans arXiv queries for a topic, keeps only the papers it judges relevant,
+extracts their key ideas, regroups those ideas into cross-paper themes (where the
+papers agree and where they contradict), and writes a cited synthesis report.
+Each run is saved as a knowledge base you can chat with.
+
 ## Stack
 
 | Concern | Technology |
 |---|---|
 | Frontend | React 18, Vite 6 — no CSS framework, styles inlined as a JS template literal |
 | AI | [OpenRouter](https://openrouter.ai) — any supported model |
+| Research agent | LangGraph JS (`@langchain/langgraph`) running server-side in `api/agent.js`, streamed to the UI as SSE |
 | Paper sources | arXiv Atom API, Hugging Face Daily Papers JSON API |
 | Full text | `arxiv.org/html/{id}` → `ar5iv` fallback, via CORS proxies |
 | Deployment | Vercel — static site + Node serverless function |
 
 ## Quick start
 
-Requires Node ≥ 18 and an [OpenRouter API key](https://openrouter.ai/keys).
+Requires Node ≥ 20 and an [OpenRouter API key](https://openrouter.ai/keys).
 
 ```bash
 npm install
@@ -45,9 +52,10 @@ keys saved in localStorage by earlier versions are removed automatically.
 
 | Command | Does |
 |---|---|
-| `npm run dev` | Vite dev server (foreground) with the `/api/chat` handler |
+| `npm run dev` | Vite dev server (foreground) with the `/api/chat` and `/api/agent` handlers |
 | `npm run build` | Production build to `dist/` |
 | `npm run preview` | Preview the built bundle |
+| `npm test` | Node test suite (`tests/*.test.js`) — API auth, arXiv parsing, agent graph |
 | `make install` | `npm install` |
 | `make run` / `make stop` / `make restart` | Run detached (PID in `.vite.pid`, logs in `.vite.log`) |
 | `make status` / `make logs` | Process state / dev server logs |
@@ -69,6 +77,11 @@ Override the port with `make run PORT=3000`.
 | **Subject finder** | Re-ranks loaded papers in real time without a new API call |
 | **Free-text filter** | Across title, authors, abstract, TL;DR, method, results, tags |
 | **Paper chat** | RAG-style chat grounded in full paper text, evidence cited with `[E1]` ids |
+| **Research agent** | LangGraph agent: query planning → relevance grading (with iterative query refinement) → idea extraction → cross-paper theme regrouping → parallel understand / challenge / practice / compare analyses → cited synthesis report with a self-review + revision pass, streamed live |
+| **Knowledge base** | Research runs saved in `localStorage` (`pb_knowledge`); select runs and chat across them — the agent can also search arXiv and read papers mid-answer |
+| **Partial salvage** | Sections stream in as they finish; a failed or stopped run can be saved as a (marked) partial knowledge run |
+| **Follow-up research** | Every open question the critic raises has a "Research this →" button that seeds a new agent run |
+| **Briefing export** | Copy or download the whole research briefing (papers, themes, concepts, comparison table, critique, practice, synthesis) as Markdown |
 | **Bookmarks** | Star papers into a Saved tab, persisted in `localStorage` |
 | **Markdown export** | Copy or download the digest |
 | **Dark mode** | Persisted across sessions |
@@ -86,6 +99,14 @@ Override the port with `make run PORT=3000`.
 ```
 api/
   chat.js               # Vercel serverless function — proxies OpenRouter
+  agent.js              # Vercel serverless function — LangGraph research agent (SSE)
+  _lib/                 # shared server modules (not deployed as routes)
+    auth.js             #   access-token / browser-key auth, shared with chat.js
+    graph.js            #   LangGraph research graph + knowledge-chat tool loop
+    arxiv.js            #   Node-side arXiv search, Atom parsing, full-text fetch
+    model.js            #   ChatOpenAI configured for OpenRouter
+    text.js             #   pure text/scoring helpers ported from App.jsx
+tests/                  # node:test suite (npm test)
 src/
   App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~3k lines)
   main.jsx              # React entry point
@@ -116,6 +137,51 @@ flowchart LR
 The serverless function exists so the API key stays server-side. The direct
 browser path is opt-in and only used when you paste a key into Settings.
 
+### How the research agent works
+
+`POST /api/agent` runs a LangGraph `StateGraph` server-side and streams
+data-only SSE frames (`phase`, `log`, `papers`, `idea_progress`, `partial`,
+`tool`, `result`, `error`, `done`). `partial` frames carry each section
+(ideas, themes, concepts, critique, practice, comparison, report) as soon as
+it is ready, so the client can salvage and save a partial run when a later
+step fails or the run is stopped:
+
+```
+plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas → regroup_themes ─┬→ understand_concepts ─┬→ synthesize → review_report ─┬→ END
+                    ▲                           │                                  ├→ challenge_claims ────┤                              │
+                    └────── refine_queries ←────┘                                  ├→ practical_guide ─────┤               revise_report ←┘
+                     (too few relevant papers,                                     └→ compare_papers ──────┘           (self-review found issues;
+                      max 2 rounds)                                                 (four passes in parallel)           at most one revision)
+```
+
+- **Research** (`{action: "research", topic}`): the model fans the topic out
+  into complementary arXiv queries, candidates are lexically prefiltered, then
+  LLM-graded 0–100 for relevance (threshold 70). Ideas (claims, methods,
+  findings, limitations) are extracted per paper and regrouped into
+  cross-paper themes with agreements and contradictions. Three analysis passes
+  then run in parallel — **understand** (key concepts explained plainly),
+  **challenge** (a skeptical review: weaknesses, assumptions, conflicting
+  claims, gaps, open questions), **practice** (scenario → approach
+  recommendations, pitfalls, resources), and **compare** (a per-paper
+  approach/contribution/evidence/limitation matrix) — before a final markdown
+  report with `[n]` citations (out-of-range citations are stripped
+  mechanically). The agent then **reviews its own report** against the
+  extracted ideas (unsupported claims, mis-citations, ignored disagreements)
+  and revises it at most once when the review finds real issues. Hard caps
+  bound every run (≤8 queries, ≤80 graded papers, ≤16 extracted papers, ≈29
+  LLM calls worst case). `options.deep` also feeds each paper's full text into
+  idea extraction.
+- **Chat** (`{action: "chat", messages, knowledge}`): a tool-loop agent with
+  `consult_knowledge` (lexical search over the knowledge payload the browser
+  sends), `search_arxiv`, and `read_paper`. Knowledge lives only in the
+  browser (`pb_knowledge`); the server holds no state.
+
+Auth matches `/api/chat` (`Authorization: Bearer <PAPERPULSE_ACCESS_TOKEN>`),
+plus one addition: a user's own key can be sent as `X-OpenRouter-Key` — the
+graph still runs server-side, and the key is only forwarded to OpenRouter.
+Server-funded requests always use the server's `OPENROUTER_MODEL`; only
+own-key requests may pick a model.
+
 ### How paper chat works
 
 1. Fetch the full HTML render from `arxiv.org/html/{id}`, falling back to
@@ -141,7 +207,7 @@ recency, HF upvotes, and quality signals ("state of the art", "benchmark", …).
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key — used only in `api/chat.js` |
+| `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key — used only by `api/chat.js` and `api/agent.js` |
 | `PAPERPULSE_ACCESS_TOKEN` | Yes (server) | Private access token, at least 32 characters; generate with `openssl rand -hex 32`. Without it, server chat is disabled. Never expose it with a `VITE_` prefix. |
 | `OPENROUTER_MODEL` | No | Server-side model for `/api/chat`. The client model is ignored for server-routed requests. |
 | `VITE_OPENROUTER_MODEL` | No | Browser default shown in the Settings panel |
@@ -150,8 +216,9 @@ Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
 
 ### localStorage keys
 
-`pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats`. Clear them in
-DevTools → Application → Local Storage for a clean state.
+`pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
+(saved research runs + knowledge chat). Clear them in DevTools → Application →
+Local Storage for a clean state.
 
 ## Deploy on Vercel
 
@@ -162,9 +229,11 @@ DevTools → Application → Local Storage for a clean state.
 3. Deploy. Enter the private access token in Settings to use server-funded chat.
    Public visitors can enter their own OpenRouter API key instead.
 
-`vercel.json` handles the rest: `npm run build` → `dist`, `api/chat.js` as a
-serverless function with a 30-second max duration, and an SPA rewrite sending
-all non-API routes to `index.html`.
+`vercel.json` handles the rest: `npm run build` → `dist`, `api/chat.js` (30s
+max duration) and `api/agent.js` (300s — a research run makes many LLM calls)
+as serverless functions, and an SPA rewrite sending all non-API routes to
+`index.html`. If your plan rejects `maxDuration: 300` at deploy time, lower it
+to your plan's limit (classic Hobby caps at 60s).
 
 ## Privacy and deployment security
 

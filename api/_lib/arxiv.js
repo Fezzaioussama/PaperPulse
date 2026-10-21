@@ -1,0 +1,110 @@
+import { XMLParser } from "fast-xml-parser";
+import { compactText, normId } from "./text.js";
+
+// Node-side arXiv access. Mirrors the client helpers in src/App.jsx but
+// without DOMParser and without CORS proxies (the server fetches directly).
+
+const FULLTEXT_LIMIT = 60000;
+
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  isArray: (name) => ["entry", "author", "category", "link"].includes(name),
+});
+
+// Produces the exact paper shape the client builds in parseArxivXml
+// (App.jsx:968–995): {title, authors, date, url, abstract, categories, source}.
+export function parseArxivXml(xml) {
+  let feed;
+  try { feed = parser.parse(xml)?.feed; } catch (_) { return []; }
+  const entries = Array.isArray(feed?.entry) ? feed.entry : [];
+  return entries.map((e) => {
+    const authors = (e.author || [])
+      .map((a) => compactText(a?.name || ""))
+      .filter(Boolean);
+    const authorStr = authors.length > 2 ? `${authors[0]} et al.` : authors.join(", ") || "—";
+    const published = compactText(e.published || "");
+    const links = e.link || [];
+    const absLink = links.find((l) => l?.["@_rel"] === "alternate");
+    const categories = (e.category || [])
+      .map((c) => c?.["@_term"])
+      .filter(Boolean);
+    return {
+      title: compactText(e.title || ""),
+      authors: authorStr,
+      date: published ? published.slice(0, 10) : "",
+      url: absLink?.["@_href"] || compactText(e.id || ""),
+      abstract: compactText(e.summary || ""),
+      categories,
+      source: "arxiv",
+    };
+  }).filter((p) => p.title && p.abstract);
+}
+
+export async function fetchArxiv(query, count, sortBy = "relevance") {
+  const sort = sortBy === "relevance" ? "relevance" : "submittedDate";
+  const apiUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=${sort}&sortOrder=descending&max_results=${count}`;
+  try {
+    const res = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    if (xml && xml.includes("<entry")) return parseArxivXml(xml);
+  } catch (_) { /* treat a failed query as empty */ }
+  return [];
+}
+
+export function dedupe(papers) {
+  const seen = new Set();
+  const out = [];
+  for (const p of papers) {
+    const k = normId(p.url) || p.title.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(p);
+  }
+  return out;
+}
+
+// DOMParser-free, regex-based HTML → text. Lossier than the client version,
+// which is acceptable: idea extraction defaults to abstracts and full text is
+// an opt-in, best-effort input.
+export function htmlToTextNode(html) {
+  if (!html) return "";
+  let s = String(html)
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|nav|header|footer|svg)\b[\s\S]*?<\/\1>/gi, " ");
+  s = s
+    .replace(/<h[1-4][^>]*>/gi, "\n## ")
+    .replace(/<li[^>]*>/gi, "\n- ")
+    .replace(/<(p|div|section|article|blockquote|figcaption|tr|br)[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+  s = s
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+  return s
+    .replace(/[ \t]+/g, " ")
+    .replace(/\r?\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export async function fetchPaperTextNode(arxivIdOrUrl) {
+  const id = normId(String(arxivIdOrUrl || ""));
+  if (!/^\d{4}\.\d{4,5}$/.test(id)) return "";
+  const urls = [
+    `https://arxiv.org/html/${id}`,
+    `https://ar5iv.labs.arxiv.org/html/${id}`,
+  ];
+  for (const u of urls) {
+    try {
+      const res = await fetch(u, { signal: AbortSignal.timeout(12000) });
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (!html || !/<\/?(article|main|body)/i.test(html)) continue;
+      const text = htmlToTextNode(html);
+      if (text && text.length > 500) return text.slice(0, FULLTEXT_LIMIT);
+    } catch (_) { /* next source */ }
+  }
+  return "";
+}

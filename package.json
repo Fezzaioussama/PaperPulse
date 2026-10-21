@@ -7,14 +7,20 @@
     "dev": "vite",
     "build": "vite build",
     "vercel-build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
+    "@langchain/core": "^1.2.20",
+    "@langchain/langgraph": "^1.5.1",
+    "@langchain/openai": "^1.6.3",
+    "fast-xml-parser": "^5.11.2",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
