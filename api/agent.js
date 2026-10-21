@@ -8,6 +8,7 @@ import {
 import {
   buildComposeGraph, ideateAngles, normalizeMaterials, normalizeOutline, resolveStyle, ARTICLE_LENGTHS,
 } from "./_lib/compose.js";
+import { buildLabGraph, resolveLabLimits } from "./_lib/lab.js";
 
 // Without this flag Vercel buffers the whole response and SSE silently
 // degrades to one blob delivered at the end.
@@ -55,8 +56,8 @@ export default async function handler(req, res) {
   }
 
   const action = body.action;
-  if (action !== "research" && action !== "chat" && action !== "ingest" && action !== "compose") {
-    return sendJson(res, 400, { error: 'action must be "research", "chat", "ingest", or "compose".' });
+  if (!["research", "chat", "ingest", "compose", "lab"].includes(action)) {
+    return sendJson(res, 400, { error: 'action must be "research", "chat", "ingest", "compose", or "lab".' });
   }
 
   // ingest: fetch one source (arXiv id or safe public URL) and return its
@@ -74,6 +75,7 @@ export default async function handler(req, res) {
   }
 
   let topic = "";
+  let objective = "";
   let messages = [];
   let knowledge = null;
   let composeMode = "";
@@ -85,6 +87,11 @@ export default async function handler(req, res) {
     topic = typeof body.topic === "string" ? body.topic.trim() : "";
     if (topic.length < TOPIC_MIN || topic.length > TOPIC_MAX) {
       return sendJson(res, 400, { error: `topic must be a string of ${TOPIC_MIN}-${TOPIC_MAX} characters.` });
+    }
+  } else if (action === "lab") {
+    objective = typeof body.objective === "string" ? body.objective.trim() : "";
+    if (objective.length < TOPIC_MIN || objective.length > TOPIC_MAX) {
+      return sendJson(res, 400, { error: `objective must be a string of ${TOPIC_MIN}-${TOPIC_MAX} characters.` });
     }
   } else if (action === "compose") {
     composeMode = body.mode;
@@ -164,6 +171,30 @@ export default async function handler(req, res) {
           practice: final.practice,
           comparison: final.comparison,
           figures: final.figures,
+          report: final.report,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        },
+      });
+    } else if (action === "lab") {
+      const startedAt = new Date().toISOString();
+      const graph = buildLabGraph();
+      const final = await graph.invoke(
+        { objective, limits: resolveLabLimits(body.options) },
+        { configurable: { model, emit, signal: ac.signal }, signal: ac.signal, recursionLimit: 12 }
+      );
+      emit({
+        type: "result",
+        lab: {
+          id: randomUUID(),
+          objective,
+          plan: final.plan,
+          papers: final.papers,
+          sourceCounts: final.sourceCounts,
+          findings: final.findings,
+          hypotheses: final.hypotheses,
+          debate: final.debate,
+          protocols: final.protocols,
           report: final.report,
           startedAt,
           finishedAt: new Date().toISOString(),

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence, MotionConfig } from "motion/react";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Topic presets → arXiv search queries. Categories (cat:cs.CL …) give far
@@ -197,7 +197,7 @@ const apiCall = (prompt, maxTokens = 10000) =>
 // ── research agent transport: POST /api/agent, then read SSE events. ──
 // Unlike chatCall, browser-key mode still goes through /api/agent (the
 // LangGraph graph runs server-side); the key is only forwarded to OpenRouter.
-async function agentCall({ action, topic, messages, knowledge, mode, goal, materials, style, outline, options, onEvent, signal }) {
+async function agentCall({ action, topic, objective, messages, knowledge, mode, goal, materials, style, outline, options, onEvent, signal }) {
   const apiKey = getApiKey();
   const res = await fetch("/api/agent", {
     method: "POST",
@@ -208,7 +208,7 @@ async function agentCall({ action, topic, messages, knowledge, mode, goal, mater
         : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
     },
     body: JSON.stringify({
-      action, topic, messages, knowledge, mode, goal, materials, style, outline,
+      action, topic, objective, messages, knowledge, mode, goal, materials, style, outline,
       options: { ...(options || {}), ...(apiKey ? { model: getModel() } : {}) },
     }),
     signal,
@@ -629,6 +629,84 @@ function buildComposeMaterials(groups) {
     }),
   }));
   return { sources, groups: outGroups };
+}
+
+// ── lab investigations: saved multi-agent runs (pb_knowledge.labs) ──
+const LABS_LIMIT = 6;
+
+function readLabs() {
+  const all = readKnowledge();
+  return Array.isArray(all.labs) ? all.labs : [];
+}
+
+function saveLab(lab) {
+  const all = readKnowledge();
+  const compact = {
+    ...lab,
+    papers: (lab.papers || []).slice(0, 16).map(p => ({ ...p, abstract: clipText(p.abstract || "", 400) })),
+    report: String(lab.report || "").slice(0, 20000),
+  };
+  const labs = [compact, ...readLabs().filter(l => l.id !== lab.id)].slice(0, LABS_LIMIT);
+  setJSON(LS.knowledge, { ...all, labs });
+  return labs;
+}
+
+function deleteLab(id) {
+  const all = readKnowledge();
+  const labs = readLabs().filter(l => l.id !== id);
+  setJSON(LS.knowledge, { ...all, labs });
+  return labs;
+}
+
+// Full investigation as one markdown document (export / copy).
+function buildLabMarkdown(lab) {
+  const papers = lab.papers || [];
+  const idx = new Map(papers.map((p, i) => [agentPaperKey(p), i + 1]));
+  const L = [`# Investigation: ${lab.objective}`, ""];
+  L.push(`_${(lab.finishedAt || "").slice(0, 10)} · ${papers.length} papers · sources: arXiv ${lab.sourceCounts?.arxiv ?? 0}, Semantic Scholar ${lab.sourceCounts?.semanticscholar ?? 0}, OpenAlex ${lab.sourceCounts?.openalex ?? 0}_`);
+  L.push("", "## Papers", "");
+  papers.forEach((p, i) =>
+    L.push(`${i + 1}. [${p.title}](${p.url}) — ${p.authors}, ${p.date}${p.citations != null ? ` · ${p.citations} citations` : ""}${p.tag ? ` · ${p.tag}` : ""}`));
+  if (lab.findings?.length) {
+    L.push("", "## Verified evidence", "");
+    for (const f of lab.findings) {
+      L.push(`### [${idx.get(f.paperId) || "?"}] ${f.title} _(${f.evidence})_`, "");
+      for (const c of f.claims) {
+        L.push(`- **${c.kind}** (${c.verified ? "quote verified" : "quote unverified"}): ${c.claim}`);
+        if (c.quote) L.push(`  > ${c.quote}`);
+      }
+    }
+  }
+  if (lab.hypotheses?.length) {
+    L.push("", "## Hypotheses", "");
+    for (const h of lab.hypotheses) {
+      const v = lab.debate?.verdicts?.find(x => x.hypothesisId === h.id);
+      L.push(`### ${h.id} — ${v ? `${v.verdict} (confidence ${v.confidence})` : "undebated"}`, "", h.statement, "");
+      if (h.rationale) L.push(`*Rationale:* ${h.rationale}`);
+      if (h.novelty?.length) L.push(`*Closest prior work:* ${h.novelty.map(n => `[${n.title}](${n.url})`).join("; ")}`);
+    }
+  }
+  if (lab.debate?.disagreements?.length) {
+    L.push("", "## Unresolved disagreements", "");
+    for (const d of lab.debate.disagreements) L.push(`- ${d}`);
+  }
+  if (lab.protocols?.length) {
+    L.push("", "## Experiment protocols (not yet executed)", "");
+    for (const p of lab.protocols) {
+      L.push(`### ${p.hypothesisId}: ${p.objective}`, "");
+      const row = (label, v) => v?.length && L.push(`- **${label}:** ${v.join("; ")}`);
+      row("Independent variables", p.independentVars);
+      row("Dependent variables", p.dependentVars);
+      row("Baselines", p.baselines);
+      row("Datasets", p.datasets);
+      row("Metrics", p.metrics);
+      row("Ablations", p.ablations);
+      row("Risks", p.risks);
+      if (p.acceptance) L.push(`- **Acceptance criteria:** ${p.acceptance}`);
+    }
+  }
+  if (lab.report) L.push("", "## Report", "", lab.report);
+  return L.join("\n");
 }
 
 // Article + numbered sources as one markdown document (export / copy).
@@ -1781,6 +1859,11 @@ function MessageContent({ content }) {
   return <>{blocks.length ? blocks : <p>{renderInlineText(content)}</p>}</>;
 }
 
+// AI-native typing indicator: 3-dot pulse shown while an agent is working.
+const Dots = () => (
+  <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
+);
+
 function ChatModal({ paper, onClose }) {
   const [messages, setMessages] = useState(() => readPaperChatHistory(paper));
   const [input, setInput] = useState("");
@@ -2227,7 +2310,7 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
             <div className="chat-kicker">Chat with knowledge</div>
             <div className="chat-title">{selectedTopics || "Saved research"}</div>
             <div className="chat-status">
-              {(sending || toolNote) && <span className="mini-spin" aria-hidden="true" />}
+              {(sending || toolNote) && <Dots />}
               <span>{toolNote || (sending ? "Thinking..." : `${runIds.length} research run${runIds.length === 1 ? "" : "s"} in context`)}</span>
             </div>
           </div>
@@ -2518,7 +2601,7 @@ function ResearchPanel({ flash, onChatPaper }) {
           <div className="agent-steps" aria-label="Agent progress">
             {steps.map((s, i) => (
               <div key={`${s.phase}-${i}`} className={`agent-step ${s.done ? "done" : "on"}`}>
-                {!s.done && <span className="mini-spin" aria-hidden="true" />}
+                {!s.done && <Dots />}
                 <span className="agent-step-label">{s.label}</span>
                 {!s.done && s.phase === "extract" && ideaProgress && (
                   <span className="agent-step-count">{ideaProgress.done}/{ideaProgress.total}</span>
@@ -3380,7 +3463,7 @@ function StudioPanel({ flash }) {
           <div className="agent-steps" aria-label="Draft progress">
             {steps.map((s, i) => (
               <div key={`${s.phase}-${i}`} className={`agent-step ${s.done ? "done" : "on"}`}>
-                {!s.done && <span className="mini-spin" aria-hidden="true" />}
+                {!s.done && <Dots />}
                 <span className="agent-step-label">{s.label}</span>
                 {!s.done && s.phase === "draft" && sectionProgress && (
                   <span className="agent-step-count">{sectionProgress.done}/{sectionProgress.total}</span>
@@ -3472,6 +3555,633 @@ function StudioPanel({ flash }) {
   );
 }
 
+// ── The Lab: multi-agent investigation workspace ──
+
+const LAB_STAGES = [
+  { id: "plan", label: "Director" },
+  { id: "literature", label: "Scout" },
+  { id: "analyze", label: "Analyst" },
+  { id: "hypothesize", label: "Ideator" },
+  { id: "debate", label: "Debate" },
+  { id: "protocol", label: "Methodology" },
+  { id: "report", label: "Writer" },
+];
+
+const AGENT_COLORS = {
+  director: "var(--accent)", scout: "var(--viz-paper)", analyst: "var(--viz-concept)",
+  ideator: "var(--viz-theme)", skeptic: "var(--danger)", proponent: "var(--success, var(--viz-concept))",
+  arbiter: "var(--ink)", methodologist: "var(--accent-2)", writer: "var(--muted)",
+};
+
+// Read-only live view of the investigation workflow: each stage lights up as
+// its agent starts and checks off when the next one takes over.
+function LabPipeline({ stageStatus }) {
+  return (
+    <div className="lab-pipeline" aria-label="Investigation pipeline">
+      {LAB_STAGES.map((s, i) => {
+        const status = stageStatus[s.id] || "pending";
+        return (
+          <span key={s.id} className="lab-stage-wrap">
+            {i > 0 && <span className="lab-arrow" aria-hidden="true">→</span>}
+            <span className={`lab-stage ${status}`}>
+              {status === "running" && <Dots />}
+              {status === "done" && <span aria-hidden="true">✓</span>}
+              {s.label}
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function LabPanel({ flash }) {
+  const [objective, setObjective] = useState("");
+  const [deep, setDeep] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [stageStatus, setStageStatus] = useState({});
+  const [feed, setFeed] = useState([]);
+  const [draft, setDraft] = useState({});
+  const [lab, setLab] = useState(null);
+  const [savedLabs, setSavedLabs] = useState(() => readLabs());
+  const [error, setError] = useState("");
+  const abortRef = useRef(null);
+  const feedRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => {
+    feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight, behavior: "smooth" });
+  }, [feed]);
+
+  const pushFeed = (entry) => setFeed(prev => [...prev.slice(-59), { ...entry, ts: Date.now() }]);
+
+  const start = async () => {
+    const o = objective.trim().slice(0, 300);
+    if (o.length < 3 || running) return;
+    setRunning(true); setError(""); setStageStatus({}); setFeed([]); setDraft({}); setLab(null);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      await agentCall({
+        action: "lab",
+        objective: o,
+        options: deep ? { deep: true } : undefined,
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (evt.type === "phase") {
+            setStageStatus(prev => {
+              const next = { ...prev };
+              for (const k of Object.keys(next)) if (next[k] === "running") next[k] = "done";
+              next[evt.phase] = "running";
+              return next;
+            });
+          } else if (evt.type === "agent") {
+            pushFeed({ t: "agent", agent: evt.agent, name: evt.name, status: evt.status, label: evt.label });
+          } else if (evt.type === "tool") {
+            pushFeed({ t: "tool", agent: evt.agent, name: evt.name, label: evt.detail });
+          } else if (evt.type === "log") {
+            pushFeed({ t: "log", label: evt.message });
+          } else if (evt.type === "partial") {
+            setDraft(d => ({ ...d, [evt.key]: evt.value }));
+          } else if (evt.type === "result" && evt.lab) {
+            setLab(evt.lab);
+            setStageStatus(prev => Object.fromEntries(Object.keys({ ...prev, report: 1 }).map(k => [k, "done"])));
+            setSavedLabs(saveLab(evt.lab));
+            flash("Investigation saved");
+          }
+        },
+      });
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Investigation failed.");
+    } finally {
+      setRunning(false);
+      abortRef.current = null;
+    }
+  };
+
+  const stop = () => abortRef.current?.abort();
+
+  const exportLab = (download) => {
+    if (!lab) return;
+    const md = buildLabMarkdown(lab);
+    if (download) {
+      const blob = new Blob([md], { type: "text/markdown" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `paperpulse-investigation-${new Date().toISOString().slice(0, 10)}.md`;
+      a.click(); URL.revokeObjectURL(a.href);
+      flash("Investigation downloaded");
+    } else {
+      navigator.clipboard?.writeText(md).then(() => flash("Investigation copied as Markdown"), () => flash("Copy failed"));
+    }
+  };
+
+  const loadLab = (l) => {
+    setLab(l); setObjective(l.objective || ""); setDraft({}); setStageStatus({}); setFeed([]); setError("");
+  };
+
+  const removeLab = (id) => {
+    setSavedLabs(deleteLab(id));
+    if (lab?.id === id) setLab(null);
+    flash("Investigation deleted");
+  };
+
+  const view = {
+    plan: lab?.plan || draft.plan || [],
+    papers: lab?.papers || draft.papers || [],
+    findings: lab?.findings || draft.findings || [],
+    hypotheses: lab?.hypotheses || draft.hypotheses || [],
+    debate: lab?.debate || draft.debate || null,
+    protocols: lab?.protocols || draft.protocols || [],
+    report: lab?.report || draft.report || "",
+    stats: draft.stats || null,
+  };
+  const paperIndex = new Map(view.papers.map((p, i) => [agentPaperKey(p), i + 1]));
+  const verdictFor = (hid) => view.debate?.verdicts?.find(v => v.hypothesisId === hid);
+  const reportForDisplay = view.report.replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
+
+  return (
+    <>
+      <section className={`topic-panel lab-panel${running ? " running" : ""}`} aria-label="Lab investigation">
+        <div className="section-head">
+          <div>
+            <span className="section-label">The Lab</span>
+            <p className="section-copy">A multi-agent investigation: the Director plans, the Scout searches arXiv + Semantic Scholar + OpenAlex, the Analyst extracts quote-verified evidence, hypotheses are debated by a Skeptic and a Proponent, and the Methodologist designs experiment protocols.</p>
+          </div>
+        </div>
+        <div className="controls">
+          <label className="fld compact">
+            <span className="ctl-label">Research objective</span>
+            <input
+              className="custom-in"
+              placeholder="e.g. reduce memory consumption during long-context LLM inference"
+              value={objective}
+              disabled={running}
+              onChange={e => setObjective(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !running && start()}
+            />
+          </label>
+          <label className="toggle" title="Read more full text per paper (slower, deeper evidence)">
+            <input type="checkbox" checked={deep} disabled={running} onChange={e => setDeep(e.target.checked)} />
+            <span>Deep read</span>
+          </label>
+          {running ? (
+            <button type="button" className="run-btn" onClick={stop}>Stop</button>
+          ) : (
+            <button type="button" className="run-btn primary-action" onClick={start} disabled={objective.trim().length < 3}>
+              Launch investigation
+            </button>
+          )}
+        </div>
+
+        {(running || Object.keys(stageStatus).length > 0) && <LabPipeline stageStatus={stageStatus} />}
+
+        {feed.length > 0 && (
+          <div className="lab-feed" ref={feedRef} aria-label="Agent activity">
+            {feed.map((f, i) => (
+              <div key={i} className={`feed-row ${f.t}`}>
+                {f.t !== "log" && (
+                  <span className="feed-agent" style={{ color: AGENT_COLORS[f.agent] || "var(--muted)" }}>
+                    <span className="feed-dot" style={{ background: AGENT_COLORS[f.agent] || "var(--muted)" }} aria-hidden="true" />
+                    {f.t === "tool" ? `${f.agent} → ${f.name}` : f.name}
+                  </span>
+                )}
+                <span className="feed-label">{f.t === "agent" && f.status === "done" ? "✓ " : ""}{f.label}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {error && <div className="error-box" role="alert"><div>{error}</div></div>}
+      </section>
+
+      {view.plan.length > 0 && (
+        <section className="results" aria-label="Investigation plan">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Director's plan</span>
+              <p className="section-copy">How the objective was decomposed across the agents.</p>
+            </div>
+          </div>
+          <div className="lab-plan">
+            {view.plan.map((t, i) => (
+              <div key={i} className="lab-task" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                <span className="feed-agent" style={{ color: AGENT_COLORS[t.agent] || "var(--muted)" }}>
+                  <span className="feed-dot" style={{ background: AGENT_COLORS[t.agent] || "var(--muted)" }} aria-hidden="true" />
+                  {t.agent}
+                </span>
+                <span>{t.task}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {view.papers.length > 0 && (
+        <section className="results" aria-label="Literature sources">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Sources ({view.papers.length})</span>
+              <p className="section-copy">Merged and deduplicated across arXiv, Semantic Scholar, and OpenAlex, then graded for relevance.</p>
+            </div>
+            {lab && (
+              <div className="knowledge-actions">
+                <button type="button" className="ghost-btn" onClick={() => exportLab(false)}>Copy MD</button>
+                <button type="button" className="ghost-btn" onClick={() => exportLab(true)}>Export MD</button>
+              </div>
+            )}
+          </div>
+          <div className="knowledge-list">
+            {view.papers.map((p, i) => (
+              <div key={agentPaperKey(p) + i} className="knowledge-row lab-source" style={{ animationDelay: `${(i % 8) * 40}ms` }}>
+                <span className="paper-chip">[{i + 1}]</span>
+                <span className="lab-source-main">
+                  <a href={p.url} target="_blank" rel="noreferrer">{p.title}</a>
+                  <span className="knowledge-meta">
+                    {p.authors} · {(p.date || "n.d.").slice(0, 10)}
+                    {p.citations != null ? ` · ${p.citations} citations` : ""}
+                  </span>
+                </span>
+                {p.tag && <span className={`lab-tag ${p.tag}`}>{p.tag}</span>}
+                <span className={`source-badge ${p.source}`}>{p.source === "semanticscholar" ? "S2" : p.source}</span>
+                {p.relevance != null && <span className="relevance-badge">{p.relevance}</span>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {view.findings.length > 0 && (
+        <section className="results" aria-label="Verified evidence">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Evidence</span>
+              <p className="section-copy">Claims with verbatim quotes. “Verified” means the quote was mechanically matched against the fetched source text — not taken on the model's word.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {view.findings.map((f, i) => (
+              <div key={f.paperId} className="theme-card" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">
+                  <span className="paper-chip">[{paperIndex.get(f.paperId) || "?"}]</span> {f.title}
+                  <span className={`evidence-badge ${f.evidence}`}>{f.evidence}</span>
+                </div>
+                {f.claims.map((c, j) => (
+                  <div key={j} className="lab-claim">
+                    <div>
+                      <span className={`idea-kind ${c.kind}`}>{c.kind}</span>
+                      <span className={`quote-badge ${c.verified ? "ok" : "warn"}`}>
+                        {c.verified ? "✓ quote verified" : "quote unverified"}
+                      </span>
+                    </div>
+                    <p className="lab-claim-text">{c.claim}</p>
+                    {c.quote && <blockquote className="lab-quote">“{c.quote}”</blockquote>}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {view.hypotheses.length > 0 && (
+        <section className="results" aria-label="Hypothesis board">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Hypothesis board</span>
+              <p className="section-copy">Testable hypotheses with debate verdicts and an API-based novelty probe (closest existing work, found by real search — not generated).</p>
+            </div>
+          </div>
+          <div className="angle-grid">
+            {view.hypotheses.map((h, i) => {
+              const v = verdictFor(h.id);
+              return (
+                <div key={h.id} className="angle-card" style={{ animationDelay: `${(i % 6) * 70}ms` }}>
+                  <div className="lab-hyp-head">
+                    <span className="angle-title">{h.id}</span>
+                    {v && (
+                      <span className={`verdict-badge ${v.verdict}`}>
+                        {v.verdict} · {v.confidence}
+                      </span>
+                    )}
+                  </div>
+                  <p className="angle-thesis">{h.statement}</p>
+                  {h.rationale && <p className="angle-why">{h.rationale}</p>}
+                  {v?.reason && <p className="angle-why"><strong>Arbiter:</strong> {v.reason}</p>}
+                  {h.paperIds?.length > 0 && (
+                    <div className="theme-papers">
+                      {h.paperIds.map(id => paperIndex.get(id)
+                        ? <span key={id} className="paper-chip">[{paperIndex.get(id)}]</span>
+                        : null)}
+                    </div>
+                  )}
+                  {h.novelty?.length > 0 && (
+                    <div className="lab-novelty">
+                      <strong>Closest prior work</strong>
+                      {h.novelty.map((n, j) => (
+                        <a key={j} href={n.url} target="_blank" rel="noreferrer">{n.title}</a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {view.debate && (view.debate.critiques?.length > 0 || view.debate.disagreements?.length > 0) && (
+        <section className="results" aria-label="Scientific debate">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Debate</span>
+              <p className="section-copy">The Skeptic attacks, the Proponent rebuts only where evidence allows, the Arbiter rules — and unresolved disagreements are recorded, not smoothed over.</p>
+            </div>
+          </div>
+          <div className="critique-list">
+            {(view.debate.critiques || []).map((c, i) => (
+              <div key={`c-${i}`} className="critique-row" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                <span className="critique-kind weakness">skeptic · {c.hypothesisId}</span>
+                <div className="critique-body"><span>{c.point}</span></div>
+              </div>
+            ))}
+            {(view.debate.rebuttals || []).map((r, i) => (
+              <div key={`r-${i}`} className="critique-row" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                <span className="critique-kind rebuttal">proponent · {r.hypothesisId}</span>
+                <div className="critique-body"><span>{r.point}</span></div>
+              </div>
+            ))}
+            {(view.debate.disagreements || []).length > 0 && (
+              <div className="critique-questions lab-disagreements">
+                <strong>Unresolved disagreements</strong>
+                <ul>{view.debate.disagreements.map((d, i) => <li key={i}>{d}</li>)}</ul>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {view.protocols.length > 0 && (
+        <section className="results" aria-label="Experiment protocols">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Experiment protocols</span>
+              <p className="section-copy">Rigorous designs for the surviving hypotheses. Execution needs a sandboxed runner, which this deployment does not include yet — these are ready-to-run plans, not results.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {view.protocols.map((p, i) => (
+              <div key={p.hypothesisId + i} className="theme-card lab-protocol" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">{p.hypothesisId}: {p.objective}</div>
+                {[["Independent vars", p.independentVars], ["Dependent vars", p.dependentVars],
+                  ["Baselines", p.baselines], ["Datasets", p.datasets], ["Metrics", p.metrics],
+                  ["Ablations", p.ablations], ["Risks", p.risks]].map(([label, items]) =>
+                  items?.length > 0 && (
+                    <div key={label} className="protocol-row">
+                      <strong>{label}</strong>
+                      <span>{items.join(" · ")}</span>
+                    </div>
+                  ))}
+                {p.acceptance && (
+                  <div className="protocol-row accept">
+                    <strong>Accept / reject</strong>
+                    <span>{p.acceptance}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {view.report && (
+        <section className="results" aria-label="Investigation report">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Report</span>
+              <p className="section-copy">Citations [n] point into the source list above. Contested hypotheses are reported as contested.</p>
+            </div>
+          </div>
+          {view.stats && (
+            <div className="lab-stats">
+              <span>{view.stats.papers} papers</span>
+              <span>{view.stats.claims} claims</span>
+              <span>{view.stats.verifiedQuotes} verified quotes</span>
+              <span>{view.stats.fulltextAnalyses} full-text reads</span>
+              {Object.entries(view.stats.verdicts || {}).map(([k, n]) => <span key={k}>{n} {k}</span>)}
+            </div>
+          )}
+          <div className="agent-report"><MessageContent content={reportForDisplay} /></div>
+        </section>
+      )}
+
+      {savedLabs.length > 0 && (
+        <section className="results" aria-label="Saved investigations">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Saved investigations</span>
+              <p className="section-copy">Kept in this browser (last {LABS_LIMIT}).</p>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {savedLabs.map((l, i) => (
+              <div key={l.id} className="knowledge-row" style={{ animationDelay: `${(i % 6) * 50}ms` }}>
+                <span className="knowledge-topic">{l.objective}</span>
+                <span className="knowledge-meta">
+                  {(l.papers || []).length} papers · {(l.hypotheses || []).length} hypotheses · {(l.finishedAt || "").slice(0, 10)}
+                </span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" onClick={() => loadLab(l)}>Load</button>
+                  <button type="button" className="ghost-btn" onClick={() => removeLab(l.id)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {!running && !lab && view.papers.length === 0 && savedLabs.length === 0 && (
+        <section className="empty hero-empty">
+          <strong>The Lab runs full multi-agent investigations.</strong>
+          <span>Give it a research objective. Nine agents search three literature APIs, verify evidence quotes mechanically, debate the hypotheses, and design experiment protocols.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
+// ── Authentication gate ──
+// No user accounts exist by design: "signing in" verifies one of the two
+// existing credentials (the user's own OpenRouter key, or a private
+// deployment's server access token) and keeps it in tab memory, exactly like
+// the Settings panel. Guests can enter too — agent runs stay locked until a
+// credential is added.
+
+const AUTH_SS = "pb_auth_entered";
+
+// A request that passes auth fails action validation with 400 — so 400 means
+// the token is good, while 401/503 surface the server's own error message.
+async function verifyServerToken(token) {
+  const res = await fetch("/api/agent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+    body: JSON.stringify({ action: "verify" }),
+  });
+  if (res.status === 400) return { ok: true };
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  return { ok: false, error: data?.error || `Server API status ${res.status}.` };
+}
+
+async function verifyOpenRouterKey(key) {
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/key", {
+      headers: { "Authorization": `Bearer ${key}` },
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "OpenRouter rejected this key. Check it on your OpenRouter dashboard and paste it again." };
+    }
+    return { ok: true };
+  } catch (_) {
+    return { ok: true }; // network/CORS hiccup: never lock the user out over it
+  }
+}
+
+function AuthGate({ onEnter, theme, onToggleTheme }) {
+  const [method, setMethod] = useState("key"); // key | token
+  const [value, setValue] = useState("");
+  const [show, setShow] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, [method]);
+
+  const submit = async () => {
+    const v = value.trim();
+    if (!v || verifying) return;
+    setError("");
+    if (method === "key" && !/^sk-or-/.test(v)) {
+      setError("OpenRouter keys start with sk-or-. Paste the full key.");
+      return;
+    }
+    setVerifying(true);
+    try {
+      const res = method === "key" ? await verifyOpenRouterKey(v) : await verifyServerToken(v);
+      if (res.ok) onEnter({ kind: method, value: v });
+      else setError(res.error);
+    } catch (err) {
+      setError(err.message || "Verification failed. Try again.");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  return (
+    <div className="auth-page">
+      <button
+        type="button"
+        className="icon-btn auth-theme"
+        title="Toggle theme"
+        aria-label="Toggle theme"
+        onClick={onToggleTheme}
+      >
+        {theme === "dark" ? "Light" : "Dark"}
+      </button>
+      <motion.div
+        className="auth-card"
+        initial={{ opacity: 0, y: 26, scale: 0.97 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={SPRING}
+      >
+        <div className="auth-brand">
+          <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+            <defs>
+              <linearGradient id="bm-auth" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stopColor="#7c3aed" />
+                <stop offset="1" stopColor="#0891b2" />
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="28" height="28" rx="9" fill="url(#bm-auth)" />
+            <path d="M9 21 L13.5 10.5 L17.5 18.5 L20 13.5 L23 16" fill="none" stroke="#fff" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div>
+            <div className="kicker">AI research agent platform</div>
+            <div className="auth-name">{APP_NAME}</div>
+          </div>
+        </div>
+        <h2 className="auth-title">Unlock your workspace</h2>
+        <p className="auth-copy">Sign in with a credential to wake the research, chat, and writing agents.</p>
+
+        <div className="auth-methods">
+          <button
+            type="button"
+            className={`auth-method${method === "key" ? " on" : ""}`}
+            aria-pressed={method === "key"}
+            onClick={() => { setMethod("key"); setError(""); }}
+          >
+            <strong>OpenRouter API key</strong>
+            <span>Runs on your own account — pick any model, billed to you directly.</span>
+          </button>
+          <button
+            type="button"
+            className={`auth-method${method === "token" ? " on" : ""}`}
+            aria-pressed={method === "token"}
+            onClick={() => { setMethod("token"); setError(""); }}
+          >
+            <strong>Server access token</strong>
+            <span>For private deployments — the token your admin configured.</span>
+          </button>
+        </div>
+
+        <form className="auth-form" onSubmit={e => { e.preventDefault(); submit(); }}>
+          <label className="fld">
+            <span className="ctl-label">{method === "key" ? "Your OpenRouter key" : "Access token"}</span>
+            <div className="auth-input-row">
+              <input
+                ref={inputRef}
+                type={show ? "text" : "password"}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={method === "key" ? "sk-or-v1-..." : "Paste the access token"}
+                value={value}
+                disabled={verifying}
+                onChange={e => { setValue(e.target.value); setError(""); }}
+              />
+              <button
+                type="button"
+                className="icon-btn auth-eye"
+                aria-label={show ? "Hide credential" : "Show credential"}
+                aria-pressed={show}
+                onClick={() => setShow(s => !s)}
+              >
+                {show ? (
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" /><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="2" /><path d="M4.5 4.5l15 15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" /><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="2" /></svg>
+                )}
+              </button>
+            </div>
+          </label>
+          {error && <div className="auth-error" role="alert">{error}</div>}
+          <button type="submit" className="run-btn primary-action auth-submit" disabled={!value.trim() || verifying}>
+            {verifying ? <><Dots /> Verifying...</> : "Unlock workspace"}
+          </button>
+        </form>
+
+        <div className="auth-divider"><span>or</span></div>
+        <button type="button" className="ghost-btn auth-guest" onClick={() => onEnter(null)}>
+          Explore without signing in →
+        </button>
+        <p className="auth-note">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" strokeWidth="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" strokeWidth="2" /></svg>
+          Credentials never leave this tab's memory — nothing is stored, and a reload signs you out. Guests can browse briefings, the knowledge base, and drafts; agent runs unlock once a credential is added here or in Settings.
+        </p>
+      </motion.div>
+    </div>
+  );
+}
+
 export default function App() {
   const [selected, setSelected] = useState(["LLMs"]);
   const [customTopic, setCustomTopic] = useState("");
@@ -3503,7 +4213,12 @@ export default function App() {
   const [embKeyInput, setEmbKeyInput] = useState("");
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
-  const [mode, setMode] = useState("digest"); // digest | research
+  const [mode, setMode] = useState("digest"); // digest | research | studio
+  // The auth gate shows once per tab session; credentials themselves stay in
+  // tab memory only, so a hard reload signs the user out by design.
+  const [authed, setAuthed] = useState(() => {
+    try { return sessionStorage.getItem(AUTH_SS) === "1"; } catch { return true; }
+  });
 
   // restore last digest from cache (no auto-fetch — saves API credits)
   useEffect(() => {
@@ -3518,12 +4233,25 @@ export default function App() {
   // theme → body + persistence
   useEffect(() => {
     try { localStorage.setItem(LS.theme, theme); } catch {}
-    document.body.style.background = theme === "dark" ? "#0b0f1c" : "#f6f8fd";
+    document.body.style.background = theme === "dark" ? "#0c0a1d" : "#f9f6ff";
   }, [theme]);
 
   useEffect(() => { setJSON(LS.bookmarks, bookmarks); }, [bookmarks]);
 
   const flash = useCallback((msg) => { setToast(msg); setTimeout(() => setToast(""), 1800); }, []);
+
+  const enterWorkspace = useCallback((credential) => {
+    if (credential?.kind === "key") {
+      browserApiKey = credential.value;
+      setKeyInput(credential.value);
+    } else if (credential?.kind === "token") {
+      serverAccessToken = credential.value;
+      setAccessTokenInput(credential.value);
+    }
+    try { sessionStorage.setItem(AUTH_SS, "1"); } catch {}
+    setAuthed(true);
+    flash(credential ? "Signed in — agents unlocked" : "Browsing as guest — add a credential in Settings to run agents");
+  }, [flash]);
 
   const toggleTopic = (label) => {
     setSelected(prev => prev.includes(label) ? prev.filter(t => t !== label) : [...prev, label]);
@@ -3696,15 +4424,40 @@ export default function App() {
   const savedCount = Object.keys(bookmarks).length;
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className={`app ${theme === "dark" ? "dark" : ""}`}>
       <style>{CSS}</style>
 
-      <main className="app-shell">
+      {!authed && (
+        <AuthGate
+          onEnter={enterWorkspace}
+          theme={theme}
+          onToggleTheme={() => setTheme(t => t === "dark" ? "light" : "dark")}
+        />
+      )}
+
+      {authed && <main className="app-shell">
         <header className="masthead">
           <div className="brand-block">
-            <div className="kicker">AI research briefing workspace</div>
-            <h1 className="brand-name">{APP_NAME}</h1>
-            <p className="brand-copy">Triage fresh arXiv and Hugging Face papers by topic, impact, tags, and saved notes.</p>
+            <div className="kicker">AI research agent platform</div>
+            <div className="brand-row">
+              <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+                <defs>
+                  <linearGradient id="bm-g" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0" stopColor="#7c3aed" />
+                    <stop offset="1" stopColor="#0891b2" />
+                  </linearGradient>
+                </defs>
+                <rect x="2" y="2" width="28" height="28" rx="9" fill="url(#bm-g)" />
+                <path d="M9 21 L13.5 10.5 L17.5 18.5 L20 13.5 L23 16" fill="none" stroke="#fff" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <h1 className="brand-name">{APP_NAME}</h1>
+              <span className="agent-status" title="The research, chat, and writing agents are available">
+                <span className="status-dot" aria-hidden="true" />
+                Agents online
+              </span>
+            </div>
+            <p className="brand-copy">Triage fresh papers, run deep research agents, and turn the knowledge into articles.</p>
           </div>
           <div className="mast-right">
             <div className="run-context" aria-label="Briefing context">
@@ -3721,10 +4474,15 @@ export default function App() {
                 aria-label="Toggle theme"
                 onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}
               >
+                {theme === "dark" ? (
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.4" fill="none" stroke="currentColor" strokeWidth="2" /><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5 5l2.1 2.1M16.9 16.9L19 19M19 5l-2.1 2.1M7.1 16.9L5 19" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 14.6A8.2 8.2 0 1 1 9.4 3.7a6.8 6.8 0 1 0 10.9 10.9z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" /></svg>
+                )}
                 {theme === "dark" ? "Light" : "Dark"}
               </button>
               <div className="mode-switch" role="tablist" aria-label="Workspace mode">
-                {[["digest", "Digest"], ["research", "Research"], ["studio", "Studio"]].map(([m, label]) => (
+                {[["digest", "Digest"], ["research", "Research"], ["lab", "Lab"], ["studio", "Studio"]].map(([m, label]) => (
                   <button
                     key={m}
                     type="button"
@@ -3752,6 +4510,7 @@ export default function App() {
                 aria-expanded={showSettings}
                 onClick={() => setShowSettings(s => !s)}
               >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h8M16 7h4M4 12h3M11 12h9M4 17h11M19 17h1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /><circle cx="14" cy="7" r="2" fill="none" stroke="currentColor" strokeWidth="2" /><circle cx="9" cy="12" r="2" fill="none" stroke="currentColor" strokeWidth="2" /><circle cx="17" cy="17" r="2" fill="none" stroke="currentColor" strokeWidth="2" /></svg>
                 Settings
               </button>
             </div>
@@ -3808,6 +4567,8 @@ export default function App() {
         )}
 
         {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} />}
+
+        {mode === "lab" && <LabPanel flash={flash} />}
 
         {mode === "studio" && <StudioPanel flash={flash} />}
 
@@ -3975,11 +4736,12 @@ export default function App() {
           </section>
         )}
         </>}
-      </main>
+      </main>}
 
       {chatPaper && <ChatModal key={getPaperChatId(chatPaper)} paper={chatPaper} onClose={() => setChatPaper(null)} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
+    </MotionConfig>
   );
 }
 
@@ -5284,56 +6046,65 @@ input:disabled, select:disabled {
 .chat-status { transition:opacity .2s ease; }
 .chat-status .mini-spin + span { animation:breathe 1.6s ease-in-out infinite; }
 
-/* ── modern skin ──
-   Token-level reskin: vivid indigo accent with a gradient, larger radii,
-   layered shadows, aurora page background, pill controls, Inter typography
+/* ── modern skin: AI-native agent platform ──
+   Token-level reskin (ui-ux-pro-max "AI-Native UI" profile): AI purple
+   primary with a cyan interaction accent, minimal chrome, larger radii,
+   layered shadows, violet aurora background, pill controls, Inter typography
    (loaded in index.html). Later rules override the base styles above. */
 .app {
-  --accent:#3b63f3;
-  --accent-strong:#2c49c7;
-  --accent-soft:#e9eeff;
-  --focus:rgba(59,99,243,.18);
+  --accent:#7c3aed;
+  --accent-strong:#5f21c9;
+  --accent-soft:#f1e9fe;
+  --accent-2:#0891b2;
+  --focus:rgba(124,58,237,.20);
+  --ink:#1e1b4b;
+  --muted:#475569;
+  --surface-2:#faf8ff;
+  --surface-3:#f3eefc;
+  --line:#e3dbf6;
+  --line-strong:#c9bbea;
   --radius:16px;
   --radius-sm:11px;
-  --shadow:0 1px 2px rgba(16,24,40,.05), 0 16px 44px rgba(16,24,40,.09);
-  --accent-grad:linear-gradient(135deg, #3b63f3 0%, #7b5bf0 100%);
-  --bg:#f6f8fd;
+  --shadow:0 1px 2px rgba(30,27,75,.05), 0 16px 44px rgba(30,27,75,.10);
+  --accent-grad:linear-gradient(135deg, #7c3aed 0%, #5b4ae8 100%);
+  --bg:#f9f6ff;
   /* categorical viz hues (paper/theme/concept) — validated for CVD + contrast
      against the light surface; dark mode gets its own validated steps. */
-  --viz-paper:#3b63f3;
+  --viz-paper:#7c3aed;
   --viz-theme:#d97706;
   --viz-concept:#0d9488;
   accent-color:var(--accent);
   background:
-    radial-gradient(1100px 520px at 88% -12%, rgba(123,91,240,.10), transparent 60%),
-    radial-gradient(900px 460px at -8% -4%, rgba(59,99,243,.09), transparent 55%),
+    radial-gradient(1100px 520px at 88% -12%, rgba(124,58,237,.10), transparent 60%),
+    radial-gradient(900px 460px at -8% -4%, rgba(8,145,178,.08), transparent 55%),
     var(--bg);
   background-attachment:fixed;
   -webkit-font-smoothing:antialiased;
 }
 .app.dark {
-  --bg:#0b0f1c;
-  --surface:#131a2c;
-  --surface-2:#182136;
-  --surface-3:#1e2a44;
-  --line:#243052;
-  --line-strong:#33426e;
-  --accent:#8fb0ff;
-  --accent-strong:#c1d4ff;
-  --accent-soft:#1c2947;
-  --focus:rgba(143,176,255,.22);
-  --shadow:0 1px 2px rgba(0,0,0,.3), 0 18px 50px rgba(0,0,0,.45);
-  --accent-grad:linear-gradient(135deg, #5f86ff 0%, #9a7bff 100%);
-  --viz-paper:#5b7ef7;
+  --bg:#0c0a1d;
+  --surface:#15112b;
+  --surface-2:#1a1536;
+  --surface-3:#221b45;
+  --line:#2c2358;
+  --line-strong:#43367e;
+  --accent:#a78bfa;
+  --accent-strong:#c9b6fd;
+  --accent-soft:#241a4a;
+  --accent-2:#22d3ee;
+  --focus:rgba(167,139,250,.25);
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 18px 50px rgba(0,0,0,.5);
+  --accent-grad:linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+  --viz-paper:#8b5cf6;
   --viz-theme:#c47207;
   --viz-concept:#0e9888;
   background:
-    radial-gradient(1100px 520px at 88% -12%, rgba(122,92,240,.16), transparent 60%),
-    radial-gradient(900px 460px at -8% -4%, rgba(64,116,255,.12), transparent 55%),
+    radial-gradient(1100px 520px at 88% -12%, rgba(139,92,246,.17), transparent 60%),
+    radial-gradient(900px 460px at -8% -4%, rgba(34,211,238,.08), transparent 55%),
     var(--bg);
   background-attachment:fixed;
 }
-::selection { background:#3b63f3; color:#fff; }
+::selection { background:#7c3aed; color:#fff; }
 
 /* typography: tight display heading with a gradient wordmark */
 .brand-name {
@@ -5361,14 +6132,14 @@ input:disabled, select:disabled {
   background:var(--accent-grad);
   border-color:transparent;
   color:#fff;
-  box-shadow:0 8px 22px rgba(59,99,243,.28);
+  box-shadow:0 8px 22px rgba(124,58,237,.30);
 }
 .run-btn.primary-action:hover, .chat-send:hover {
   color:#fff;
   border-color:transparent;
   transform:translateY(-1px);
   filter:brightness(1.07);
-  box-shadow:0 11px 28px rgba(59,99,243,.36);
+  box-shadow:0 11px 28px rgba(124,58,237,.38);
 }
 .run-btn.primary-action:disabled, .chat-send:disabled { filter:saturate(.4) opacity(.7); box-shadow:none; }
 .chip.on {
@@ -5660,8 +6431,8 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .angle-card::before {
   content:"";
   position:absolute;
-  inset:0 0 auto 0;
-  height:3px;
+  inset:0 auto 0 0;
+  width:3px;
   background:var(--accent-grad);
 }
 .angle-card:hover { box-shadow:var(--shadow); border-color:var(--line-strong); }
@@ -5687,5 +6458,361 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .board { grid-template-columns:1fr; }
   .mode-switch { flex:1; }
   .mode-tab { flex:1; }
+}
+
+/* ── AI-native platform chrome (ui-ux-pro-max profile) ── */
+.brand-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.brand-mark {
+  width:36px;
+  height:36px;
+  flex:none;
+  filter:drop-shadow(0 5px 12px rgba(124,58,237,.35));
+}
+.agent-status {
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  font-size:11.5px;
+  font-weight:600;
+  letter-spacing:.03em;
+  color:var(--muted);
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:999px;
+  padding:4px 11px;
+}
+.status-dot {
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:var(--accent-2);
+  animation:statusPulse 2.4s ease-in-out infinite;
+}
+@keyframes statusPulse {
+  0%, 100% { box-shadow:0 0 0 0 rgba(34,211,238,.45); }
+  50% { box-shadow:0 0 0 5px rgba(34,211,238,0); }
+}
+.icon-btn svg { width:14px; height:14px; margin-right:6px; flex:none; }
+
+/* typing indicator: the AI-native 3-dot pulse for every working agent */
+.typing-dots { display:inline-flex; align-items:center; gap:4px; }
+.typing-dots i {
+  width:6px;
+  height:6px;
+  border-radius:50%;
+  background:var(--accent);
+  opacity:.35;
+  animation:dotPulse 1.2s ease-in-out infinite;
+}
+.typing-dots i:nth-child(2) { animation-delay:.18s; }
+.typing-dots i:nth-child(3) { animation-delay:.36s; }
+@keyframes dotPulse {
+  0%, 100% { opacity:.35; transform:translateY(0); }
+  40% { opacity:1; transform:translateY(-3px); }
+}
+
+/* context cards: left accent marks agent-generated context */
+.theme-card, .critique-questions, .practice-notes {
+  border-left:3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ── the lab: multi-agent investigation ── */
+.lab-pipeline {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:4px;
+  margin-top:16px;
+  padding:12px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+}
+.lab-stage-wrap { display:inline-flex; align-items:center; gap:4px; }
+.lab-arrow { color:var(--muted-2); font-size:12px; padding:0 2px; }
+.lab-stage {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  font-weight:600;
+  padding:5px 12px;
+  border-radius:999px;
+  border:1px solid var(--line);
+  background:var(--surface);
+  color:var(--muted);
+  transition:all .25s ease;
+}
+.lab-stage.running {
+  border-color:var(--accent);
+  color:var(--accent);
+  box-shadow:0 0 0 3px var(--focus);
+  animation:breathe 1.8s ease-in-out infinite;
+}
+.lab-stage.done { background:var(--accent-soft); border-color:transparent; color:var(--accent-strong); }
+.lab-feed {
+  margin-top:14px;
+  max-height:240px;
+  overflow-y:auto;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  padding:12px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  font-size:12.5px;
+}
+.feed-row { display:flex; gap:10px; align-items:baseline; animation:slideIn .25s ease both; }
+.feed-row.log { color:var(--muted-2); padding-left:16px; }
+.feed-row.tool .feed-label { color:var(--muted); }
+.feed-agent {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-weight:700;
+  font-size:11.5px;
+  white-space:nowrap;
+  flex:none;
+  min-width:130px;
+}
+.feed-dot { width:7px; height:7px; border-radius:50%; flex:none; }
+.feed-label { color:var(--ink); min-width:0; overflow-wrap:anywhere; }
+.lab-plan { display:flex; flex-direction:column; gap:8px; }
+.lab-task {
+  display:flex;
+  gap:12px;
+  align-items:baseline;
+  padding:10px 14px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  font-size:13px;
+  animation:rise .3s ease both;
+}
+.lab-source { flex-wrap:nowrap; }
+.lab-source-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.lab-source-main a { color:var(--ink); font-weight:600; text-decoration:none; }
+.lab-source-main a:hover { color:var(--accent); }
+.source-badge {
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:.05em;
+  text-transform:uppercase;
+  padding:2px 8px;
+  border-radius:999px;
+  background:var(--surface-3);
+  color:var(--muted);
+  flex:none;
+}
+.source-badge.semanticscholar { color:var(--viz-theme); }
+.source-badge.openalex { color:var(--viz-concept); }
+.source-badge.arxiv { color:var(--viz-paper); }
+.lab-tag {
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:2px 8px;
+  border-radius:999px;
+  flex:none;
+}
+.lab-tag.foundational { background:var(--accent-soft); color:var(--accent-strong); }
+.lab-tag.recent { background:var(--surface-3); color:var(--viz-concept); }
+.evidence-badge {
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:2px 8px;
+  border-radius:999px;
+  background:var(--surface-3);
+  color:var(--muted);
+  margin-left:8px;
+  vertical-align:2px;
+}
+.evidence-badge.fulltext { color:var(--viz-concept); }
+.lab-claim { margin-top:10px; display:flex; flex-direction:column; gap:5px; }
+.lab-claim-text { margin:0; font-size:13px; line-height:1.5; color:var(--ink); }
+.lab-quote {
+  margin:0;
+  padding:6px 12px;
+  border-left:3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  font-size:12px;
+  line-height:1.5;
+  color:var(--muted);
+  font-style:italic;
+}
+.quote-badge {
+  font-size:10px;
+  font-weight:700;
+  padding:2px 8px;
+  border-radius:999px;
+  margin-left:6px;
+}
+.quote-badge.ok { background:var(--success-soft, var(--accent-soft)); color:var(--success, var(--accent-strong)); }
+.quote-badge.warn { background:var(--danger-soft); color:var(--danger); }
+.lab-hyp-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.verdict-badge {
+  font-size:10.5px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:3px 10px;
+  border-radius:999px;
+}
+.verdict-badge.supported { background:var(--success-soft, var(--accent-soft)); color:var(--success, var(--accent-strong)); }
+.verdict-badge.contested { background:var(--surface-3); color:var(--viz-theme); }
+.verdict-badge.rejected { background:var(--danger-soft); color:var(--danger); }
+.lab-novelty { display:flex; flex-direction:column; gap:4px; font-size:12px; margin-top:2px; }
+.lab-novelty strong { font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+.lab-novelty a { color:var(--accent); text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.lab-novelty a:hover { text-decoration:underline; }
+.critique-kind.rebuttal { background:var(--success-soft, var(--accent-soft)); color:var(--success, var(--accent-strong)); }
+.lab-disagreements { border-left:3px solid var(--viz-theme); }
+.lab-protocol .protocol-row {
+  display:flex;
+  gap:10px;
+  font-size:12.5px;
+  margin-top:7px;
+  align-items:baseline;
+}
+.protocol-row strong {
+  flex:none;
+  width:118px;
+  font-size:10.5px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  color:var(--muted);
+}
+.protocol-row.accept strong { color:var(--accent-strong); }
+.lab-stats {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-bottom:14px;
+}
+.lab-stats span {
+  font-size:11.5px;
+  font-weight:600;
+  padding:4px 11px;
+  border-radius:999px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  color:var(--muted);
+  font-variant-numeric:tabular-nums;
+}
+@media (max-width:640px) {
+  .feed-agent { min-width:0; }
+  .protocol-row { flex-direction:column; gap:2px; }
+}
+
+/* ── authentication gate ── */
+.auth-page {
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:48px 16px;
+  position:relative;
+}
+.auth-theme { position:absolute; top:18px; right:18px; }
+.auth-card {
+  width:100%;
+  max-width:460px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:calc(var(--radius) + 6px);
+  box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.55);
+  padding:30px 30px 26px;
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+}
+.app.dark .auth-card { box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.05); }
+.auth-brand { display:flex; align-items:center; gap:12px; }
+.auth-brand .brand-mark { width:42px; height:42px; }
+.auth-name {
+  font-size:22px;
+  font-weight:800;
+  letter-spacing:-0.03em;
+  background:var(--accent-grad);
+  -webkit-background-clip:text;
+  background-clip:text;
+  color:transparent;
+}
+.auth-title { margin:8px 0 0; font-size:24px; letter-spacing:-0.02em; color:var(--ink); }
+.auth-copy { margin:0; font-size:13.5px; color:var(--muted); line-height:1.5; }
+.auth-methods { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:4px; }
+.auth-method {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  text-align:left;
+  padding:12px 14px;
+  border-radius:var(--radius-sm);
+  background:var(--surface-2);
+  border:1.5px solid var(--line);
+  cursor:pointer;
+  font:inherit;
+  color:var(--muted);
+  transition:border-color .18s ease, background .18s ease, color .18s ease, transform .15s ease, box-shadow .18s ease;
+}
+.auth-method:hover { border-color:var(--line-strong); transform:translateY(-1px); }
+.auth-method.on {
+  border-color:var(--accent);
+  background:var(--accent-soft);
+  box-shadow:0 0 0 3px var(--focus);
+}
+.auth-method strong { font-size:13px; color:var(--ink); }
+.auth-method span { font-size:11.5px; line-height:1.45; }
+.auth-form { display:flex; flex-direction:column; gap:12px; }
+.auth-input-row { display:flex; gap:8px; align-items:stretch; }
+.auth-input-row input { flex:1; min-width:0; font-size:14px; padding:10px 12px; }
+.auth-eye { padding:0 12px; }
+.auth-eye svg { width:15px; height:15px; margin:0; }
+.auth-error {
+  font-size:12.5px;
+  color:var(--danger);
+  background:var(--danger-soft);
+  border:1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius:9px;
+  padding:8px 11px;
+}
+.auth-submit { width:100%; justify-content:center; gap:8px; padding:11px 16px; font-size:14px; }
+.auth-submit .typing-dots i { background:#fff; }
+.auth-divider {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  color:var(--muted-2);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+}
+.auth-divider::before, .auth-divider::after { content:""; flex:1; height:1px; background:var(--line); }
+.auth-guest { align-self:center; }
+.auth-note {
+  display:flex;
+  gap:8px;
+  margin:2px 0 0;
+  font-size:11.5px;
+  line-height:1.5;
+  color:var(--muted-2);
+}
+.auth-note svg { width:13px; height:13px; flex:none; margin-top:2px; }
+@media (max-width:520px) {
+  .auth-methods { grid-template-columns:1fr; }
+  .auth-card { padding:22px 18px; }
+}
+
+/* respect reduced-motion (motion/react is covered by MotionConfig) */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+    scroll-behavior:auto !important;
+  }
 }
 `;

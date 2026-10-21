@@ -103,3 +103,13 @@ export function buildTopicLexicalProfile(topic = "") {
     tokens: topicTokens(raw),
   };
 }
+
+// Mechanical evidence check: does this verbatim quote actually occur in the
+// source text? Normalization forgives casing/punctuation but not paraphrase.
+// Quotes shorter than 20 normalized chars are too weak to count as evidence.
+export function verifyQuote(sourceText, quote) {
+  if (!sourceText || !quote) return false;
+  const needle = normalizeForMatch(quote);
+  if (needle.length < 20) return false;
+  return normalizeForMatch(sourceText).includes(needle);
+}

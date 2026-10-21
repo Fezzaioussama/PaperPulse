@@ -73,6 +73,10 @@ test("agent endpoint enforces auth and input validation before any provider requ
     assert.equal((await auth({ action: "compose", mode: "draft", goal: "my article", materials: { groups: [], sources: [] } })).code, 400); // empty board
     const bigMaterials = { groups: [{ name: "g", items: [{ text: "x".repeat(220 * 1024) }] }] };
     assert.equal((await auth({ action: "compose", mode: "draft", goal: "my article", materials: bigMaterials })).code, 413);
+
+    // lab validation
+    assert.equal((await auth({ action: "lab" })).code, 400);
+    assert.equal((await auth({ action: "lab", objective: "ab" })).code, 400);
     assert.equal(calls, 0);
   } finally {
     globalThis.fetch = originalFetch;

@@ -26,6 +26,7 @@ it draft a full article — outline, section-by-section drafting, polish — wit
 |---|---|
 | Frontend | React 18, Vite 6 — no CSS framework, styles inlined as a JS template literal |
 | Motion | [`motion`](https://motion.dev) (the engine behind animate-ui): spring layout animations on the idea board, animated mode tabs |
+| Design | ["AI-Native UI" profile](https://github.com/nextlevelbuilder/ui-ux-pro-max-skill) (ui-ux-pro-max): AI purple + cyan accents, typing indicators, context cards, minimal chrome, `prefers-reduced-motion` respected, CVD-validated chart palette |
 | AI | [OpenRouter](https://openrouter.ai) — any supported model |
 | Research agent | LangGraph JS (`@langchain/langgraph`) running server-side in `api/agent.js`, streamed to the UI as SSE |
 | RAG | Browser-side vector index (IndexedDB) with pluggable embeddings: a local transformers.js model (no key) or any OpenAI-compatible `/embeddings` endpoint |
@@ -99,6 +100,9 @@ Override the port with `make run PORT=3000`.
 | **Article angles** | One click proposes 3–5 arguable takes the board could support — title, thesis, why now, outline, sources — each loadable into the composer |
 | **Article drafting** | A LangGraph pipeline (outline → draft each section → polish) writes a full article from your board, grounded in your grouping, with `[n]` citations into a numbered source list; audience / tone / length controls and an optional hand-written outline |
 | **Article export** | Drafts stream in live, are kept in the browser (`pb_articles`), and export as Markdown with the source list appended |
+| **The Lab** | A nine-agent investigation per objective: Director plans, Scout searches arXiv + Semantic Scholar + OpenAlex (merged, deduped, graded), Analyst extracts claims whose quotes are **mechanically verified** against fetched text, Ideator generates hypotheses with real novelty probes, Skeptic/Proponent/Arbiter debate (disagreements recorded, no forced consensus), Methodologist designs experiment protocols, Writer reports with provenance stats |
+| **Agent activity monitor** | Live pipeline view + a feed of agent and tool events — which agent is working, which tool it called, what it found |
+| **Authentication gate** | A full-page sign-in shown once per tab session: verify your own OpenRouter key (live against `/api/v1/key`) or a private deployment's access token (against `/api/agent`), or continue as guest — credentials stay in tab memory only, exactly like Settings |
 | **Bookmarks** | Star papers into a Saved tab, persisted in `localStorage` |
 | **Markdown export** | Copy or download the digest |
 | **Dark mode** | Persisted across sessions |
@@ -211,6 +215,13 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   Citations outside the source list are stripped mechanically. Hard caps: ≤40
   sources, ≤80 cards, ≤8 sections — ≤10 LLM calls per draft.
 
+- **Lab** (`{action: "lab", objective}`): the multi-agent investigation
+  (see `docs/PLATFORM.md`). Literature comes from three real APIs
+  (`api/_lib/scholar.js`); evidence quotes are verified mechanically
+  (`verifyQuote`); the debate records verdicts and unresolved disagreements;
+  protocols are plans for a future sandboxed runner — the stream never claims
+  an experiment ran. ≤17 LLM calls; every stage degrades gracefully.
+
 Auth matches `/api/chat` (`Authorization: Bearer <PAPERPULSE_ACCESS_TOKEN>`),
 plus one addition: a user's own key can be sent as `X-OpenRouter-Key` — the
 graph still runs server-side, and the key is only forwarded to OpenRouter.
@@ -270,14 +281,22 @@ recency, HF upvotes, and quality signals ("state of the art", "benchmark", …).
 
 Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
 
+### Optional literature-API key
+
+Semantic Scholar's anonymous pool is heavily rate-limited; set `S2_API_KEY`
+to raise the limits. arXiv and OpenAlex need no key. A rate-limited source
+simply contributes zero results — the Lab merges whatever responds.
+
 ### localStorage keys
 
 `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
-(saved research runs, library sources, knowledge chat) · `pb_studio` (the idea
+(saved research runs, lab investigations, library sources, knowledge chat) · `pb_studio` (the idea
 board) · `pb_articles` (drafted articles) · `pb_emb_provider` /
 `pb_emb_url` / `pb_emb_model` (embeddings platform; the key itself is never
-stored). The vector index lives in IndexedDB as `pb_rag`. Clear them in
-DevTools → Application for a clean state.
+stored). The vector index lives in IndexedDB as `pb_rag`, and
+`sessionStorage.pb_auth_entered` remembers that the auth gate was passed this
+tab session (never the credential itself). Clear them in DevTools →
+Application for a clean state.
 
 ## Deploy on Vercel
 
