@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sendJson, sanitizeMessages, checkAccess } from "./_lib/auth.js";
+import { fetchSourceText } from "./_lib/ingest.js";
 import { resolveModel, makeModel } from "./_lib/model.js";
 import {
   buildResearchGraph, buildChatGraph, buildChatSystemPrompt, resolveLimits,
@@ -50,8 +51,22 @@ export default async function handler(req, res) {
   }
 
   const action = body.action;
-  if (action !== "research" && action !== "chat") {
-    return sendJson(res, 400, { error: 'action must be "research" or "chat".' });
+  if (action !== "research" && action !== "chat" && action !== "ingest") {
+    return sendJson(res, 400, { error: 'action must be "research", "chat", or "ingest".' });
+  }
+
+  // ingest: fetch one source (arXiv id or safe public URL) and return its
+  // readable text for the client-side RAG library. Plain JSON, no SSE.
+  if (action === "ingest") {
+    const url = typeof body.url === "string" ? body.url.trim() : "";
+    if (!url || url.length > 2048) {
+      return sendJson(res, 400, { error: "ingest requires a url (arXiv id or http(s) URL)." });
+    }
+    const source = await fetchSourceText(url);
+    if (!source) {
+      return sendJson(res, 422, { error: "Could not fetch readable text from that source." });
+    }
+    return sendJson(res, 200, source);
   }
 
   let topic = "";

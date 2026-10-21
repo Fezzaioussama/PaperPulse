@@ -1,4 +1,5 @@
 import { sendJson, sanitizeMessages, checkAccess } from "./_lib/auth.js";
+import { getBaseUrl } from "./_lib/model.js";
 
 // Model is always taken from the server environment — never from the client.
 // This prevents a public deployment from being abused to call expensive models.
@@ -43,7 +44,7 @@ export default async function handler(req, res) {
   const maxTokens = Math.max(1, Math.min(Number.isFinite(requestedMax) ? requestedMax : MAX_TOKENS_LIMIT, MAX_TOKENS_LIMIT));
 
   try {
-    const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const upstream = await fetch(`${getBaseUrl()}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

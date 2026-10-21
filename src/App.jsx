@@ -302,6 +302,228 @@ function saveKnowledgeChat(messages) {
 
 const agentPaperKey = (p) => normId(p.url) || (p.title || "").toLowerCase().slice(0, 90);
 
+// ── RAG core: embeddings + vector store, all in the browser ──
+// The knowledge base lives client-side, so the vector index does too:
+// chunks + embeddings in IndexedDB, retrieval before each knowledge-chat
+// message. Two embedding platforms are supported — a local model via
+// transformers.js (no key, downloads ~25MB once, cached), or any
+// OpenAI-compatible /embeddings endpoint (OpenAI, Jina, Mistral, Ollama...).
+
+const EMB_LS = { provider: "pb_emb_provider", url: "pb_emb_url", model: "pb_emb_model" };
+const embSettings = {
+  provider: getLS(EMB_LS.provider, "off"), // off | local | remote
+  url: getLS(EMB_LS.url, "https://api.openai.com/v1"),
+  model: getLS(EMB_LS.model, "text-embedding-3-small"),
+};
+let embKey = ""; // remote-provider key: tab memory only, like the other credentials
+const LOCAL_EMB_MODEL = "Xenova/all-MiniLM-L6-v2";
+let localEmbedderPromise = null;
+
+function ragEnabled() { return embSettings.provider !== "off"; }
+
+function getLocalEmbedder() {
+  if (!localEmbedderPromise) {
+    localEmbedderPromise = import("@huggingface/transformers").then(({ pipeline }) =>
+      pipeline("feature-extraction", LOCAL_EMB_MODEL, { dtype: "q8" })
+    ).catch(err => { localEmbedderPromise = null; throw err; });
+  }
+  return localEmbedderPromise;
+}
+
+function l2normalize(vec) {
+  let norm = 0;
+  for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm) || 1;
+  const out = new Float32Array(vec.length);
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] / norm;
+  return out;
+}
+
+async function embedTexts(texts) {
+  if (!texts.length) return [];
+  if (embSettings.provider === "local") {
+    const pipe = await getLocalEmbedder();
+    const out = [];
+    for (let i = 0; i < texts.length; i += 8) {
+      const batch = texts.slice(i, i + 8);
+      const res = await pipe(batch, { pooling: "mean", normalize: true });
+      const dim = res.dims[res.dims.length - 1];
+      for (let r = 0; r < batch.length; r++) {
+        out.push(Float32Array.from(res.data.slice(r * dim, (r + 1) * dim)));
+      }
+    }
+    return out;
+  }
+  // remote OpenAI-compatible endpoint
+  const res = await fetch(`${embSettings.url.replace(/\/$/, "")}/embeddings`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(embKey ? { "Authorization": `Bearer ${embKey}` } : {}),
+    },
+    body: JSON.stringify({ model: embSettings.model, input: texts }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !Array.isArray(data?.data)) {
+    throw new Error(data?.error?.message || `Embeddings API status ${res.status}`);
+  }
+  return data.data.map(d => l2normalize(Float32Array.from(d.embedding)));
+}
+
+// IndexedDB vector store: one object store of chunk records.
+const RAG_DB = "pb_rag";
+let ragDbPromise = null;
+function ragDb() {
+  if (!ragDbPromise) {
+    ragDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(RAG_DB, 1);
+      req.onupgradeneeded = () => {
+        const store = req.result.createObjectStore("chunks", { keyPath: "id" });
+        store.createIndex("docId", "docId");
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }).catch(err => { ragDbPromise = null; throw err; });
+  }
+  return ragDbPromise;
+}
+
+async function ragPutChunks(records) {
+  const db = await ragDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("chunks", "readwrite");
+    for (const r of records) tx.objectStore("chunks").put(r);
+    tx.oncomplete = () => resolve(records.length);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function ragDeleteDoc(docId) {
+  const db = await ragDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("chunks", "readwrite");
+    const index = tx.objectStore("chunks").index("docId");
+    const req = index.openCursor(IDBKeyRange.only(docId));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (cursor) { cursor.delete(); cursor.continue(); }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Cosine search (vectors are normalized, so dot product) over the chunks of
+// the given docIds. Browser-scale: linear scan is fine for tens of thousands.
+async function ragSearch(queryVec, docIds, topK = 10) {
+  const db = await ragDb();
+  const allowed = new Set(docIds);
+  return new Promise((resolve, reject) => {
+    const hits = [];
+    const tx = db.transaction("chunks", "readonly");
+    const req = tx.objectStore("chunks").openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const c = cursor.value;
+      if (allowed.has(c.docId) && c.vec?.length === queryVec.length) {
+        let score = 0;
+        for (let i = 0; i < queryVec.length; i++) score += queryVec[i] * c.vec[i];
+        hits.push({ score, docId: c.docId, title: c.title, text: c.text });
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve(hits.sort((a, b) => b.score - a.score).slice(0, topK));
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Plain sliding-window chunker for library text (the paper chat has its own).
+function ragChunks(text, size = 1500, overlap = 200) {
+  const t = compactText(text);
+  if (!t) return [];
+  const chunks = [];
+  for (let start = 0; start < t.length; start += size - overlap) {
+    const slice = t.slice(start, start + size);
+    if (slice.length < 80 && chunks.length) break;
+    chunks.push(slice);
+    if (start + size >= t.length) break;
+  }
+  return chunks.slice(0, 400);
+}
+
+// Index one document (a library source, or a research run flattened to text).
+async function ragIndexDocument({ docId, title, text }) {
+  await ragDeleteDoc(docId); // re-index replaces
+  const pieces = ragChunks(text);
+  if (!pieces.length) return 0;
+  const vecs = await embedTexts(pieces.map(p => `${title}\n${p}`));
+  await ragPutChunks(pieces.map((p, i) => ({
+    id: `${docId}:${i}`, docId, title: title.slice(0, 200), text: p, vec: vecs[i], ts: Date.now(),
+  })));
+  return pieces.length;
+}
+
+// Flatten a research run into one indexable text document.
+function runToRagText(run) {
+  const parts = [];
+  for (const p of run.papers || []) parts.push(`Paper: ${p.title}\n${p.abstract || ""}`);
+  for (const entry of run.ideas || []) {
+    for (const idea of entry.ideas || []) parts.push(`${entry.title} — (${idea.kind}) ${idea.claim}. ${idea.detail || ""}`);
+  }
+  for (const t of run.themes || []) {
+    parts.push(`Theme: ${t.name}. ${t.summary} Agreements: ${(t.agreements || []).join("; ")} Contradictions: ${(t.contradictions || []).join("; ")}`);
+  }
+  for (const c of run.concepts || []) parts.push(`Concept: ${c.name}. ${c.explanation}`);
+  for (const p of run.critique?.points || []) parts.push(`Critique (${p.kind}) ${p.target || ""}: ${p.point}`);
+  for (const r of run.practice?.recommendations || []) parts.push(`Practice: when ${r.scenario || "in general"}, ${r.approach}. ${r.why || ""}`);
+  if (run.report) parts.push(run.report);
+  return parts.join("\n\n");
+}
+
+// Retrieve evidence for a knowledge-chat question from the selected runs and
+// every library source. Returns [{source, text}] for the server prompt.
+async function ragRetrieve(query, docIds, topK = 8) {
+  if (!ragEnabled() || !docIds.length) return [];
+  try {
+    const [qvec] = await embedTexts([query]);
+    const hits = await ragSearch(qvec, docIds, topK);
+    return hits.map(h => ({ source: h.title, text: clipText(h.text, 1000) }));
+  } catch (_) {
+    return []; // retrieval is best-effort; the agent still has the digest + tools
+  }
+}
+
+// Library sources (metadata in pb_knowledge.sources; chunks in IndexedDB).
+function readKnowledgeSources() {
+  const all = readKnowledge();
+  return Array.isArray(all.sources) ? all.sources : [];
+}
+
+function saveKnowledgeSources(sources) {
+  const all = readKnowledge();
+  setJSON(LS.knowledge, { ...all, sources: sources.slice(0, 30) });
+  return sources.slice(0, 30);
+}
+
+// Server-side fetch of one source (arXiv id or public URL) for the library.
+async function ingestCall(url) {
+  const apiKey = getApiKey();
+  const res = await fetch("/api/agent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey
+        ? { "X-OpenRouter-Key": apiKey }
+        : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
+    },
+    body: JSON.stringify({ action: "ingest", url }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `Server API status ${res.status}.`);
+  return data; // {title, text, origin}
+}
+
 // Full research briefing as one markdown document (export / copy).
 function buildResearchMarkdown(run) {
   const cell = (s) => String(s || "").replace(/\|/g, "/");
@@ -1690,7 +1912,7 @@ function AgentPaperRow({ paper, index, onChat }) {
   );
 }
 
-function KnowledgeChat({ runs, runIds, onClose }) {
+function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
   const [messages, setMessages] = useState(() => readKnowledgeChat());
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -1714,10 +1936,25 @@ function KnowledgeChat({ runs, runIds, onClose }) {
     setMessages(next); setInput(""); setSending(true); setToolNote("");
     try {
       let reply = "";
+      // Vector retrieval happens here in the browser (the index is local);
+      // the retrieved excerpts ride along as grounded [E#] evidence.
+      let retrieved = [];
+      if (ragEnabled()) {
+        setToolNote("Retrieving evidence...");
+        retrieved = await ragRetrieve(q, [...runIds, ...sources.map(s => s.id)]);
+        setToolNote("");
+      }
       await agentCall({
         action: "chat",
         messages: trimMessagesForModel(next),
-        knowledge: buildKnowledgePayload(runs, runIds),
+        knowledge: {
+          ...buildKnowledgePayload(runs, runIds),
+          retrieved,
+          sources: sources.slice(0, 10).map(s => ({
+            title: s.title,
+            text: s.chunks ? undefined : clipText(s.excerpt || "", 1500),
+          })),
+        },
         onEvent: (evt) => {
           if (evt.type === "tool") {
             setToolNote(
@@ -1811,6 +2048,12 @@ function ResearchPanel({ flash, onChatPaper }) {
   const [selectedRunIds, setSelectedRunIds] = useState(() => readKnowledge().runs.slice(0, 1).map(r => r.id));
   const [chatOpen, setChatOpen] = useState(false);
   const [error, setError] = useState("");
+  const [sources, setSources] = useState(() => readKnowledgeSources());
+  const [sourceInput, setSourceInput] = useState("");
+  const [noteMode, setNoteMode] = useState(false);
+  const [noteTitle, setNoteTitle] = useState("");
+  const [noteText, setNoteText] = useState("");
+  const [ingesting, setIngesting] = useState(false);
   const abortRef = useRef(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
@@ -1846,6 +2089,7 @@ function ResearchPanel({ flash, onChatPaper }) {
             setSavedRuns(runs);
             setSelectedRunIds([evt.run.id]);
             flash("Research run saved to knowledge");
+            indexRun(evt.run); // fire-and-forget; toasts its own progress
           }
         },
       });
@@ -1858,6 +2102,73 @@ function ResearchPanel({ flash, onChatPaper }) {
   };
 
   const stop = () => { abortRef.current?.abort(); };
+
+  // Embed + store a run in the vector index, then record the chunk count.
+  const indexRun = async (theRun) => {
+    if (!ragEnabled()) return;
+    try {
+      flash("Indexing for semantic search...");
+      const n = await ragIndexDocument({ docId: theRun.id, title: theRun.topic, text: runToRagText(theRun) });
+      const all = readKnowledge();
+      const runs = all.runs.map(r => (r.id === theRun.id ? { ...r, ragChunks: n } : r));
+      setJSON(LS.knowledge, { ...all, runs });
+      setSavedRuns(runs);
+      flash(`Indexed ${n} chunks for retrieval`);
+    } catch (err) {
+      flash(`Indexing failed: ${err.message || "error"}`);
+    }
+  };
+
+  // ── library sources: arXiv ids, URLs, pasted notes ──
+  const finishAddSource = async (title, text, origin) => {
+    const id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `src-${Date.now()}`;
+    let chunks = 0;
+    if (ragEnabled()) chunks = await ragIndexDocument({ docId: id, title, text });
+    const meta = {
+      id, title: title.slice(0, 200), origin, chars: text.length, chunks, ts: Date.now(),
+      // keep a lexical excerpt so the source stays searchable with RAG off
+      excerpt: clipText(text, 6000),
+    };
+    const next = saveKnowledgeSources([meta, ...sources]);
+    setSources(next);
+    flash(chunks ? `Added "${meta.title}" — ${chunks} chunks indexed` : `Added "${meta.title}"`);
+  };
+
+  const addSource = async () => {
+    const url = sourceInput.trim();
+    if (!url || ingesting) return;
+    setIngesting(true);
+    try {
+      const data = await ingestCall(url);
+      await finishAddSource(data.title || url, data.text, data.origin || "url");
+      setSourceInput("");
+    } catch (err) {
+      flash(err.message || "Could not add that source");
+    } finally {
+      setIngesting(false);
+    }
+  };
+
+  const addNote = async () => {
+    const text = noteText.trim();
+    if (text.length < 50 || ingesting) return;
+    setIngesting(true);
+    try {
+      await finishAddSource(noteTitle.trim() || `Note ${new Date().toISOString().slice(0, 10)}`, text, "note");
+      setNoteTitle(""); setNoteText(""); setNoteMode(false);
+    } catch (err) {
+      flash(err.message || "Could not add the note");
+    } finally {
+      setIngesting(false);
+    }
+  };
+
+  const removeSource = async (id) => {
+    try { await ragDeleteDoc(id); } catch (_) {}
+    const next = saveKnowledgeSources(sources.filter(s => s.id !== id));
+    setSources(next);
+    flash("Source removed");
+  };
 
   // A failed/stopped run keeps whatever the stream delivered; save it as a
   // (marked) partial knowledge run so nothing is lost.
@@ -1882,6 +2193,7 @@ function ResearchPanel({ flash, onChatPaper }) {
     setRun(partialRun);
     setError("");
     flash("Partial research saved to knowledge");
+    indexRun(partialRun);
   };
 
   const exportRun = (download) => {
@@ -1900,6 +2212,7 @@ function ResearchPanel({ flash, onChatPaper }) {
   };
 
   const removeRun = (id) => {
+    ragDeleteDoc(id).catch(() => {});
     const runs = deleteKnowledgeRun(id);
     setSavedRuns(runs);
     setSelectedRunIds(ids => ids.filter(x => x !== id));
@@ -2190,17 +2503,80 @@ function ResearchPanel({ flash, onChatPaper }) {
         </section>
       )}
 
-      {savedRuns.length > 0 && (
+      <section className="results" aria-label="Library">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Library</span>
+            <p className="section-copy">Grow the knowledge base beyond research runs: add an arXiv id, any article URL, or pasted text — each joins the retrieval index.</p>
+          </div>
+        </div>
+        <div className="library-add">
+          <input
+            className="custom-in"
+            placeholder="arXiv id (2403.01234) or https://..."
+            value={sourceInput}
+            disabled={ingesting}
+            onChange={e => setSourceInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && addSource()}
+          />
+          <button type="button" className="run-btn primary-action" onClick={addSource} disabled={ingesting || !sourceInput.trim()}>
+            {ingesting ? "Adding..." : "Add source"}
+          </button>
+          <button type="button" className="ghost-btn" onClick={() => setNoteMode(m => !m)}>
+            {noteMode ? "Hide note" : "Paste text"}
+          </button>
+        </div>
+        {noteMode && (
+          <div className="library-note">
+            <input
+              className="custom-in"
+              placeholder="Title for this note"
+              value={noteTitle}
+              disabled={ingesting}
+              onChange={e => setNoteTitle(e.target.value)}
+            />
+            <textarea
+              className="library-textarea"
+              rows={5}
+              placeholder="Paste any text (at least 50 characters): meeting notes, a blog post, an excerpt..."
+              value={noteText}
+              disabled={ingesting}
+              onChange={e => setNoteText(e.target.value)}
+            />
+            <button type="button" className="run-btn" onClick={addNote} disabled={ingesting || noteText.trim().length < 50}>
+              Add note
+            </button>
+          </div>
+        )}
+        {sources.length > 0 && (
+          <div className="knowledge-list" style={{ marginTop: 12 }}>
+            {sources.map((s, i) => (
+              <div key={s.id} className="knowledge-row" style={{ animationDelay: `${(i % 6) * 50}ms` }}>
+                <span className="knowledge-topic">{s.title}</span>
+                <span className="knowledge-meta">
+                  {s.origin} · {Math.max(1, Math.round(s.chars / 1000))}k chars
+                  {s.chunks ? ` · ${s.chunks} chunks indexed` : " · lexical only"}
+                </span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" onClick={() => removeSource(s.id)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {(savedRuns.length > 0 || sources.length > 0) && (
         <section className="results" aria-label="Knowledge base">
           <div className="section-head">
             <div>
               <span className="section-label">Knowledge base</span>
-              <p className="section-copy">Saved research runs (kept in this browser). Select runs, then chat across them.</p>
+              <p className="section-copy">Saved research runs (kept in this browser). Select runs, then chat across them and the library.</p>
             </div>
             <button
               type="button"
               className="run-btn"
-              disabled={selectedRunIds.length === 0}
+              disabled={selectedRunIds.length === 0 && sources.length === 0}
               onClick={() => setChatOpen(true)}
             >
               Chat with knowledge
@@ -2219,8 +2595,12 @@ function ResearchPanel({ flash, onChatPaper }) {
                 </label>
                 <span className="knowledge-meta">
                   {(r.papers || []).length} papers · {(r.themes || []).length} themes · {(r.finishedAt || "").slice(0, 10)}
+                  {r.ragChunks ? ` · ${r.ragChunks} chunks indexed` : ""}
                 </span>
                 <div className="knowledge-actions">
+                  {ragEnabled() && !r.ragChunks && (
+                    <button type="button" className="ghost-btn" onClick={() => indexRun(r)}>Index</button>
+                  )}
                   <button type="button" className="ghost-btn" onClick={() => loadRun(r)}>Load</button>
                   <button type="button" className="ghost-btn" onClick={() => removeRun(r.id)}>Delete</button>
                 </div>
@@ -2238,7 +2618,7 @@ function ResearchPanel({ flash, onChatPaper }) {
       )}
 
       {chatOpen && (
-        <KnowledgeChat runs={savedRuns} runIds={selectedRunIds} onClose={() => setChatOpen(false)} />
+        <KnowledgeChat runs={savedRuns} runIds={selectedRunIds} sources={sources} onClose={() => setChatOpen(false)} />
       )}
     </>
   );
@@ -2269,6 +2649,10 @@ export default function App() {
   const [keyInput, setKeyInput] = useState("");
   const [accessTokenInput, setAccessTokenInput] = useState("");
   const [modelInput, setModelInput] = useState(() => getModel());
+  const [embProviderInput, setEmbProviderInput] = useState(embSettings.provider);
+  const [embUrlInput, setEmbUrlInput] = useState(embSettings.url);
+  const [embModelInput, setEmbModelInput] = useState(embSettings.model);
+  const [embKeyInput, setEmbKeyInput] = useState("");
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
   const [mode, setMode] = useState("digest"); // digest | research
@@ -2397,9 +2781,16 @@ export default function App() {
   const saveSettings = () => {
     browserApiKey = keyInput.trim();
     serverAccessToken = accessTokenInput.trim();
+    embKey = embKeyInput.trim();
+    embSettings.provider = embProviderInput;
+    embSettings.url = embUrlInput.trim() || "https://api.openai.com/v1";
+    embSettings.model = embModelInput.trim() || "text-embedding-3-small";
     try {
       localStorage.removeItem(LS.key);
       if (modelInput.trim()) localStorage.setItem(LS.model, modelInput.trim());
+      localStorage.setItem(EMB_LS.provider, embSettings.provider);
+      localStorage.setItem(EMB_LS.url, embSettings.url);
+      localStorage.setItem(EMB_LS.model, embSettings.model);
     } catch {}
     setShowSettings(false);
     flash("Settings saved");
@@ -2524,9 +2915,35 @@ export default function App() {
                 <input placeholder="deepseek/deepseek-v4-pro" value={modelInput} onChange={e => setModelInput(e.target.value)} />
               </label>
             </div>
+            <div className="settings-grid">
+              <label className="fld">
+                <span className="ctl-label">Semantic search (embeddings)</span>
+                <select value={embProviderInput} onChange={e => setEmbProviderInput(e.target.value)}>
+                  <option value="off">Off — lexical search only</option>
+                  <option value="local">Local model (in-browser, no key)</option>
+                  <option value="remote">OpenAI-compatible API</option>
+                </select>
+              </label>
+              {embProviderInput === "remote" && (
+                <>
+                  <label className="fld">
+                    <span className="ctl-label">Embeddings base URL</span>
+                    <input placeholder="https://api.openai.com/v1" value={embUrlInput} onChange={e => setEmbUrlInput(e.target.value)} />
+                  </label>
+                  <label className="fld">
+                    <span className="ctl-label">Embeddings model</span>
+                    <input placeholder="text-embedding-3-small" value={embModelInput} onChange={e => setEmbModelInput(e.target.value)} />
+                  </label>
+                  <label className="fld">
+                    <span className="ctl-label">Embeddings API key</span>
+                    <input type="password" autoComplete="off" placeholder="sk-..." value={embKeyInput} onChange={e => setEmbKeyInput(e.target.value)} />
+                  </label>
+                </>
+              )}
+            </div>
             <div className="settings-actions">
               <button type="button" className="run-btn" onClick={saveSettings}>Save Settings</button>
-              <span className="hint">Use your own API key or a private server access token. Credentials are kept only until this tab reloads.</span>
+              <span className="hint">Use your own API key or a private server access token. Credentials are kept only until this tab reloads. The local embeddings model downloads ~25MB once and runs entirely in your browser.</span>
             </div>
           </section>
         )}
@@ -4127,6 +4544,22 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   background-clip:content-box;
 }
 .knowledge-list { display:flex; flex-direction:column; gap:8px; }
+.library-add { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+.library-add .custom-in { flex:1; min-width:240px; }
+.library-note { display:flex; flex-direction:column; gap:10px; margin-top:12px; }
+.library-note .run-btn { align-self:flex-start; }
+.library-textarea {
+  width:100%;
+  resize:vertical;
+  padding:10px 14px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:var(--surface);
+  color:var(--ink);
+  font:inherit;
+  line-height:1.5;
+}
+.library-textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 4px var(--focus); }
 .knowledge-row {
   display:flex;
   align-items:center;

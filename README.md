@@ -21,6 +21,7 @@ Each run is saved as a knowledge base you can chat with.
 | Frontend | React 18, Vite 6 — no CSS framework, styles inlined as a JS template literal |
 | AI | [OpenRouter](https://openrouter.ai) — any supported model |
 | Research agent | LangGraph JS (`@langchain/langgraph`) running server-side in `api/agent.js`, streamed to the UI as SSE |
+| RAG | Browser-side vector index (IndexedDB) with pluggable embeddings: a local transformers.js model (no key) or any OpenAI-compatible `/embeddings` endpoint |
 | Paper sources | arXiv Atom API, Hugging Face Daily Papers JSON API |
 | Full text | `arxiv.org/html/{id}` → `ar5iv` fallback, via CORS proxies |
 | Deployment | Vercel — static site + Node serverless function |
@@ -79,6 +80,9 @@ Override the port with `make run PORT=3000`.
 | **Paper chat** | RAG-style chat grounded in full paper text, evidence cited with `[E1]` ids |
 | **Research agent** | LangGraph agent: query planning → relevance grading (with iterative query refinement) → idea extraction → cross-paper theme regrouping → parallel understand / challenge / practice / compare analyses → cited synthesis report with a self-review + revision pass, streamed live |
 | **Knowledge base** | Research runs saved in `localStorage` (`pb_knowledge`); select runs and chat across them — the agent can also search arXiv and read papers mid-answer |
+| **RAG / semantic search** | Research runs and library sources are chunked, embedded, and stored in a browser-side vector index; each knowledge-chat question retrieves the best excerpts as cited `[E#]` evidence |
+| **Library** | Add sources beyond research runs — an arXiv id, any public article URL (fetched and cleaned server-side), or pasted text — and they join the retrieval index |
+| **Embedding platforms** | Choose in Settings: off (lexical only), a local in-browser model (`all-MiniLM-L6-v2` via transformers.js, ~25MB one-time download, fully private), or any OpenAI-compatible embeddings API (OpenAI, Jina, Mistral, Ollama, ...) |
 | **Partial salvage** | Sections stream in as they finish; a failed or stopped run can be saved as a (marked) partial knowledge run |
 | **Follow-up research** | Every open question the critic raises has a "Research this →" button that seeds a new agent run |
 | **Briefing export** | Copy or download the whole research briefing (papers, themes, concepts, comparison table, critique, practice, synthesis) as Markdown |
@@ -176,11 +180,37 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   sends), `search_arxiv`, and `read_paper`. Knowledge lives only in the
   browser (`pb_knowledge`); the server holds no state.
 
+- **Ingest** (`{action: "ingest", url}`): fetches one source for the library —
+  an arXiv id via the paper pipeline, or a public article URL stripped to
+  readable text server-side. Guarded against SSRF: http(s) only, default
+  ports, and private/internal hosts (localhost, RFC-1918, link-local metadata
+  addresses, `.local`/`.internal`) are refused before any request is made.
+
 Auth matches `/api/chat` (`Authorization: Bearer <PAPERPULSE_ACCESS_TOKEN>`),
 plus one addition: a user's own key can be sent as `X-OpenRouter-Key` — the
 graph still runs server-side, and the key is only forwarded to OpenRouter.
 Server-funded requests always use the server's `OPENROUTER_MODEL`; only
 own-key requests may pick a model.
+
+### How the RAG system works
+
+The knowledge base lives in the browser, so the vector index does too:
+
+1. **Index**: each research run (papers, ideas, themes, critique, practice,
+   report) and each library source is chunked (~1,500 chars, 200 overlap),
+   embedded, and stored in IndexedDB (`pb_rag`) with normalized vectors.
+2. **Embed**: Settings picks the platform — `local` runs
+   `Xenova/all-MiniLM-L6-v2` in the browser via transformers.js (code-split;
+   nothing loads unless enabled), `remote` calls any OpenAI-compatible
+   `/embeddings` endpoint with your key (held in tab memory only), `off`
+   falls back to lexical search everywhere.
+3. **Retrieve**: before each knowledge-chat message the client embeds the
+   question, cosine-searches the chunks of the selected runs + all library
+   sources, and sends the top excerpts with the request.
+4. **Ground**: the server agent receives them as `[E#]` evidence blocks in
+   its system prompt and cites them; the `consult_knowledge` tool still
+   covers the structured knowledge (and un-indexed sources lexically), and
+   `search_arxiv`/`read_paper` fill gaps live.
 
 ### How paper chat works
 
@@ -210,6 +240,7 @@ recency, HF upvotes, and quality signals ("state of the art", "benchmark", …).
 | `OPENROUTER_API_KEY` | Yes (server) | OpenRouter secret key — used only by `api/chat.js` and `api/agent.js` |
 | `PAPERPULSE_ACCESS_TOKEN` | Yes (server) | Private access token, at least 32 characters; generate with `openssl rand -hex 32`. Without it, server chat is disabled. Never expose it with a `VITE_` prefix. |
 | `OPENROUTER_MODEL` | No | Server-side model for `/api/chat`. The client model is ignored for server-routed requests. |
+| `OPENROUTER_BASE_URL` | No | OpenAI-compatible API root for the chat/agent backends (default `https://openrouter.ai/api/v1`). Point it at OpenAI, Ollama, vLLM, Groq, ... |
 | `VITE_OPENROUTER_MODEL` | No | Browser default shown in the Settings panel |
 
 Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
@@ -217,8 +248,10 @@ Both model variables fall back to `deepseek/deepseek-v4-pro` in code.
 ### localStorage keys
 
 `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
-(saved research runs + knowledge chat). Clear them in DevTools → Application →
-Local Storage for a clean state.
+(saved research runs, library sources, knowledge chat) · `pb_emb_provider` /
+`pb_emb_url` / `pb_emb_model` (embeddings platform; the key itself is never
+stored). The vector index lives in IndexedDB as `pb_rag`. Clear them in
+DevTools → Application for a clean state.
 
 ## Deploy on Vercel
 
