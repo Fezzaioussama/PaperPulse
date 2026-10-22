@@ -14,6 +14,9 @@ const parser = new XMLParser({
 
 // Produces the exact paper shape the client builds in parseArxivXml
 // (App.jsx:968–995): {title, authors, date, url, abstract, categories, source}.
+// The server additionally ADDS venue/isOpenAccess/pdfUrl (never renames a
+// mirrored field): arXiv has no venue, is always open access, and the PDF
+// URL derives mechanically from the arXiv id.
 export function parseArxivXml(xml) {
   let feed;
   try { feed = parser.parse(xml)?.feed; } catch (_) { return []; }
@@ -29,20 +32,27 @@ export function parseArxivXml(xml) {
     const categories = (e.category || [])
       .map((c) => c?.["@_term"])
       .filter(Boolean);
+    const url = absLink?.["@_href"] || compactText(e.id || "");
+    const id = normId(url);
     return {
       title: compactText(e.title || ""),
       authors: authorStr,
       date: published ? published.slice(0, 10) : "",
-      url: absLink?.["@_href"] || compactText(e.id || ""),
+      url,
       abstract: compactText(e.summary || ""),
       categories,
       source: "arxiv",
+      venue: null,
+      isOpenAccess: true,
+      pdfUrl: /^\d{4}\.\d{4,5}$/.test(id) ? `https://arxiv.org/pdf/${id}` : null,
     };
   }).filter((p) => p.title && p.abstract);
 }
 
+const ARXIV_SORTS = ["relevance", "submittedDate", "lastUpdatedDate"];
+
 export async function fetchArxiv(query, count, sortBy = "relevance") {
-  const sort = sortBy === "relevance" ? "relevance" : "submittedDate";
+  const sort = ARXIV_SORTS.includes(sortBy) ? sortBy : "submittedDate";
   const apiUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=${sort}&sortOrder=descending&max_results=${count}`;
   try {
     const res = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });

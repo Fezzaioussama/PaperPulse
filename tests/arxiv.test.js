@@ -52,6 +52,10 @@ test("parseArxivXml maps entries to the client paper shape", () => {
     abstract: "We study state space models for long context modeling.",
     categories: ["cs.LG", "cs.CL"],
     source: "arxiv",
+    // Server-side additions to the mirrored client shape (added, never renamed).
+    venue: null,
+    isOpenAccess: true,
+    pdfUrl: "https://arxiv.org/pdf/2401.00001",
   });
   // No alternate link → falls back to <id>; ≤2 authors are joined, not "et al.".
   assert.equal(papers[1].url, "http://arxiv.org/abs/2401.00002v1");

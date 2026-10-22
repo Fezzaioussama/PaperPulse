@@ -9,6 +9,8 @@ import {
   buildComposeGraph, ideateAngles, normalizeMaterials, normalizeOutline, resolveStyle, ARTICLE_LENGTHS,
 } from "./_lib/compose.js";
 import { buildLabGraph, resolveLabLimits } from "./_lib/lab.js";
+import { buildCollectionGraph, normalizeCollectionPapers } from "./_lib/collection.js";
+import { searchScholarly, normalizeDiscoverFilters } from "./_lib/scholar.js";
 
 // Without this flag Vercel buffers the whole response and SSE silently
 // degrades to one blob delivered at the end.
@@ -56,8 +58,8 @@ export default async function handler(req, res) {
   }
 
   const action = body.action;
-  if (!["research", "chat", "ingest", "compose", "lab"].includes(action)) {
-    return sendJson(res, 400, { error: 'action must be "research", "chat", "ingest", "compose", or "lab".' });
+  if (!["research", "chat", "ingest", "compose", "lab", "discover", "collection"].includes(action)) {
+    return sendJson(res, 400, { error: 'action must be "research", "chat", "ingest", "compose", "lab", "discover", or "collection".' });
   }
 
   // ingest: fetch one source (arXiv id or safe public URL) and return its
@@ -74,6 +76,24 @@ export default async function handler(req, res) {
     return sendJson(res, 200, source);
   }
 
+  // discover: one filtered multi-source literature search (arXiv + Semantic
+  // Scholar + OpenAlex). Plain JSON, no SSE, no LLM call. Invalid filter
+  // fields are dropped by normalization; each provider is failure-isolated,
+  // so upstream errors surface only as zero counts, never as echoed bodies.
+  if (action === "discover") {
+    const query = typeof body.query === "string" ? body.query.trim() : "";
+    if (query.length < 2 || query.length > 300) {
+      return sendJson(res, 400, { error: "discover requires a query of 2-300 characters." });
+    }
+    const filters = normalizeDiscoverFilters(body.filters);
+    const { papers, counts } = await searchScholarly({
+      plainQuery: query,
+      perSource: filters.perSource,
+      filters,
+    });
+    return sendJson(res, 200, { papers, counts, filters });
+  }
+
   let topic = "";
   let objective = "";
   let messages = [];
@@ -83,6 +103,8 @@ export default async function handler(req, res) {
   let materials = null;
   let style = null;
   let outline = null;
+  let collectionName = "";
+  let collectionPapers = null;
   if (action === "research") {
     topic = typeof body.topic === "string" ? body.topic.trim() : "";
     if (topic.length < TOPIC_MIN || topic.length > TOPIC_MAX) {
@@ -117,6 +139,21 @@ export default async function handler(req, res) {
     }
     style = resolveStyle(body.style);
     outline = normalizeOutline(body.outline, ARTICLE_LENGTHS[style.length].maxSections);
+  } else if (action === "collection") {
+    collectionName = typeof body.name === "string" ? body.name.trim() : "";
+    if (collectionName.length < 1 || collectionName.length > 120) {
+      return sendJson(res, 400, { error: "collection requires a name of 1-120 characters." });
+    }
+    if (!Array.isArray(body.papers)) {
+      return sendJson(res, 400, { error: "collection requires a papers array of 2-16 papers, each with a title." });
+    }
+    if (JSON.stringify(body.papers).length > MAX_KNOWLEDGE_BYTES) {
+      return sendJson(res, 413, { error: "collection papers payload is too large." });
+    }
+    collectionPapers = normalizeCollectionPapers(body.papers);
+    if (!collectionPapers) {
+      return sendJson(res, 400, { error: "collection requires a papers array of 2-16 papers, each with a title." });
+    }
   } else {
     messages = sanitizeMessages(body.messages);
     if (messages.length === 0) {
@@ -196,6 +233,26 @@ export default async function handler(req, res) {
           debate: final.debate,
           protocols: final.protocols,
           report: final.report,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        },
+      });
+    } else if (action === "collection") {
+      const startedAt = new Date().toISOString();
+      const graph = buildCollectionGraph();
+      const final = await graph.invoke(
+        { name: collectionName, papers: collectionPapers },
+        { configurable: { model, emit, signal: ac.signal }, signal: ac.signal, recursionLimit: 8 }
+      );
+      emit({
+        type: "result",
+        analysis: {
+          id: randomUUID(),
+          name: collectionName,
+          themes: final.themes,
+          concepts: final.concepts,
+          comparison: final.comparison,
+          brief: final.brief,
           startedAt,
           finishedAt: new Date().toISOString(),
         },

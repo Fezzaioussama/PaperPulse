@@ -160,7 +160,8 @@ export function normalizeThemes(parsed, ideas) {
   return themes.slice(0, 12);
 }
 
-const paperId = (p) => normId(p.url) || p.title.toLowerCase().slice(0, 90);
+// Stable paper identity used by every normalizer (shared with lab/collection).
+export const paperId = (p) => normId(p.url) || p.title.toLowerCase().slice(0, 90);
 
 function paperLabelList(papers) {
   return papers.map((p, i) => `[${i + 1}] ${compactText(p.title)}`).join("\n");
@@ -788,6 +789,21 @@ export function lookupKnowledge(knowledge, query) {
     const score = lexicalTopicScore({ title: s.title, abstract: s.text || "" }, profile);
     if (score > 0) hits.push({ score, kind: "library source", title: s.title, excerpt: clipText(s.text || "", 500) });
   }
+  // Curated collections (client-supplied shape — guard every level).
+  for (const c of Array.isArray(knowledge?.collections) ? knowledge.collections : []) {
+    if (!c || typeof c.name !== "string") continue;
+    for (const p of Array.isArray(c.papers) ? c.papers : []) {
+      if (!p || typeof p.title !== "string") continue;
+      const score = lexicalTopicScore({ title: p.title, abstract: typeof p.abstract === "string" ? p.abstract : "" }, profile);
+      if (score > 0) {
+        hits.push({
+          score, kind: "collection paper", collection: c.name, title: p.title,
+          authors: typeof p.authors === "string" ? p.authors : "", date: typeof p.date === "string" ? p.date : "",
+          venue: typeof p.venue === "string" ? p.venue : "", abstract: clipText(typeof p.abstract === "string" ? p.abstract : "", 400),
+        });
+      }
+    }
+  }
   hits.sort((a, b) => b.score - a.score);
   if (!hits.length) return JSON.stringify({ matches: [], note: "No knowledge-base entries matched this query." });
   return JSON.stringify({ matches: hits.slice(0, 8).map(({ score, ...rest }) => rest) });
@@ -802,6 +818,15 @@ function knowledgeDigest(knowledge) {
     const papers = (run.papers || []).slice(0, 40).map((p, i) => `[${i + 1}] ${compactText(p.title)}`).join("\n");
     return `Research run: "${run.topic}"\nThemes: ${themes}\nPapers:\n${papers}`;
   });
+  for (const c of Array.isArray(knowledge?.collections) ? knowledge.collections : []) {
+    if (!c || typeof c.name !== "string") continue;
+    const titles = (Array.isArray(c.papers) ? c.papers : [])
+      .filter((p) => p && typeof p.title === "string")
+      .slice(0, 40)
+      .map((p, i) => `[${i + 1}] ${compactText(p.title)}`)
+      .join("\n");
+    parts.push(`Collection: "${compactText(c.name)}"\nPapers:\n${titles || "—"}`);
+  }
   if (sources.length) {
     parts.push(`Library sources:\n${sources.map((s) => `- ${compactText(s.title)}`).join("\n")}`);
   }

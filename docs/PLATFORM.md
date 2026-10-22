@@ -16,7 +16,7 @@ is deliberately **not** claimed, and what each next phase requires._
 | Debate | **Added:** Skeptic → Proponent → Arbiter with per-hypothesis verdicts (supported/contested/rejected), confidence, and **recorded disagreements**; missing verdicts backfill as *contested*, never approved | Anti-sycophancy by construction |
 | Methodology | **Added:** experiment protocols (variables, baselines, datasets, metrics, ablations, risks, acceptance criteria) | Plans only — see §3 |
 | Memory | Browser: `localStorage` knowledge base + IndexedDB vector RAG (explicit product decision) | Keeps the server stateless; limits: per-browser, ~5MB |
-| UI | Digest / Research / Lab / Studio modes; Lab adds a live pipeline view and an agent activity monitor (agent + tool events) | |
+| UI | Digest / Discover / Research / Lab / Studio modes; Lab adds a live pipeline view and an agent activity monitor (agent + tool events); Discover adds a filtered multi-source search UI with catalogs, saved searches, and collections | |
 | Security | Bearer/own-key auth, SSRF guard on ingestion, no upstream error echo, prompt notes treating fetched text as data | Sound for current scope |
 
 ## 2. What the Lab run actually does (`action: "lab"`)
@@ -57,7 +57,37 @@ Reliability mechanics (all mechanical, none LLM-asserted):
   real-data metrics and activity, the 3D research universe (hand-rolled canvas
   projection, zero new deps, reduced-motion aware), Ctrl+K command palette,
   animated mode transitions, JetBrains Mono technical type, dark default.
-- **Phase B:** ingestion upgrades — PDF drag-and-drop via a parsing service,
+- **Phase B (in progress):** Discover — filtered multi-source search
+  (`action: "discover"`: date range / sort / author / venue / arXiv category /
+  open access, mapped to native provider params + a mechanical post-filter) —
+  now has its UI: a Discover mode with a filter rail (date chips / sort /
+  author / venue / category / open access), curated + user research catalogs
+  (`pb_catalogs`), saved searches (`pb_searches`), per-source result counts
+  (provider failures visible as zeros, never silent), multi-select with a
+  batch bar, and a guest arXiv-only client fallback. Collections storage
+  shipped under `pb_knowledge.collections` (≤12 collections × ≤50 papers,
+  deduped by paper key) with a CollectionPicker from cards and the batch bar.
+  Server-side, `action: "collection"` analyzes a curated set of 2–16 papers
+  (themes/concepts → comparison → cited brief, ≤3 LLM calls), and the chat
+  knowledge payload understands `knowledge.collections`. The **Knowledge
+  mode** now sits on top: a collections manager (create / rename / delete,
+  per-paper rows with Read & Chat), streaming Analyze with partial salvage and
+  the analysis persisted on the collection, Markdown + comparison-CSV exports,
+  collection-scoped knowledge chat, and a per-collection full-text retrieval
+  index (`col:<collection>:<paper>` docs — server ingest first, CORS-proxy
+  fallback, per-paper failure logging). The Library and the saved-runs
+  knowledge base moved from Research into Knowledge (Research keeps a pointer
+  after each run saves), collections join the research universe as their own
+  constellations, and the command palette opens a collection preselected.
+  The per-paper chat is now a split-screen **reader** (document pane with
+  sectioned full text + arXiv PDF tab beside the chat, draggable divider,
+  layout prefs in `pb_reader`): every answer persists a mechanical evidence
+  snapshot, and `[E#]` citations are clickable chips that jump to the exact
+  source chunk — verified by construction (snippets are literal chunks of the
+  fetched text, selected before the LLM runs), unknown ids visibly unverified.
+  With a credential, full text ingests server-side (SSRF-guarded) before the
+  CORS-proxy fallback.
+  Remaining: ingestion upgrades — PDF drag-and-drop via a parsing service,
   DOI/GitHub import, per-paper claim linking in the reader.
 - **Phase C:** execution runner — sandboxed Python (Docker), protocol → code
   scaffold (PyTorch project + tests) generated as reviewable artifacts, human
@@ -69,9 +99,10 @@ Reliability mechanics (all mechanical, none LLM-asserted):
 
 ## 5. Testing & verification discipline
 
-`npm test` (node:test, 43 tests) covers: SSE endpoint auth/validation, all
-pure normalizers, scholar source parsing + cross-source merge, quote
-verification, and full stubbed end-to-end runs of the research, compose, and
-lab graphs (prompt-marker-routed stub model + stubbed HTTP). Live smoke tests
+`npm test` (node:test, 55 tests) covers: SSE endpoint auth/validation, all
+pure normalizers (discover filters included), scholar source parsing +
+cross-source merge, quote verification, and full stubbed end-to-end runs of
+the research, compose, lab, and collection graphs (prompt-marker-routed stub
+model + stubbed HTTP). Live smoke tests
 run against the dev server with real literature APIs; LLM-dependent stages
 degrade gracefully and say so in the stream.

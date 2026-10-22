@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   invertAbstract, arxivIdFromDoi, fromSemanticScholar, fromOpenAlex,
   scholarKey, mergeScholarly, tagPaper, searchScholarly,
+  normalizeDiscoverFilters, buildArxivDiscoverQuery,
+  applyDiscoverPostFilters, sortDiscoverPapers,
 } from "../api/_lib/scholar.js";
 import { verifyQuote } from "../api/_lib/text.js";
 
@@ -81,6 +83,178 @@ test("verifyQuote only accepts verbatim quotes of real length", () => {
   assert.equal(verifyQuote(text, "reduces memory by fifty percent"), false); // paraphrase rejected
   assert.equal(verifyQuote(text, "memory"), false); // too short to count
   assert.equal(verifyQuote("", "reduces memory by forty percent"), false);
+});
+
+test("normalizeDiscoverFilters clamps and validates fields, dropping junk", () => {
+  // Junk in → everything dropped, perSource falls back to its default.
+  assert.deepEqual(normalizeDiscoverFilters(null), { perSource: 10 });
+  assert.deepEqual(normalizeDiscoverFilters("junk"), { perSource: 10 });
+  assert.deepEqual(normalizeDiscoverFilters({
+    from: "2023-1-1", to: "20241231", sort: "weird", openAccess: "yes",
+    author: "   ", venue: 42, category: "cs CL!", perSource: "nope",
+  }), { perSource: 10 });
+  // Valid fields survive; strings are compacted and clamped; perSource clamps.
+  assert.deepEqual(normalizeDiscoverFilters({
+    from: "2023-01-01", to: "2024-12-31", sort: "newest", openAccess: true,
+    author: "  Jane   Roe ", venue: "NeurIPS", category: "cs.CL", perSource: 99,
+  }), {
+    from: "2023-01-01", to: "2024-12-31", sort: "newest", openAccess: true,
+    author: "Jane Roe", venue: "NeurIPS", category: "cs.CL", perSource: 25,
+  });
+  assert.equal(normalizeDiscoverFilters({ author: "a".repeat(200) }).author.length, 120);
+  assert.equal(normalizeDiscoverFilters({ perSource: 0 }).perSource, 10); // non-positive → default
+  assert.equal(normalizeDiscoverFilters({ perSource: 3 }).perSource, 3);
+  assert.equal(normalizeDiscoverFilters({ openAccess: false }).openAccess, undefined);
+});
+
+test("buildArxivDiscoverQuery passes field syntax through and appends filter clauses", () => {
+  // Field-syntax queries are used verbatim; plain text becomes all:"...".
+  assert.equal(buildArxivDiscoverQuery('ti:"state spaces" AND cat:cs.LG', {}), 'ti:"state spaces" AND cat:cs.LG');
+  assert.equal(buildArxivDiscoverQuery('kv "cache" compression', {}), 'all:"kv cache compression"');
+  assert.equal(
+    buildArxivDiscoverQuery("state spaces", { category: "cs.CL", author: "Jane Roe" }),
+    'all:"state spaces" AND cat:cs.CL AND au:"Jane Roe"'
+  );
+  // Open-ended date windows fill the missing bound mechanically.
+  assert.equal(
+    buildArxivDiscoverQuery("ssm", { from: "2023-01-01" }),
+    'all:"ssm" AND submittedDate:[202301010000 TO 209912312359]'
+  );
+  assert.equal(
+    buildArxivDiscoverQuery("ssm", { to: "2024-06-30" }),
+    'all:"ssm" AND submittedDate:[199101010000 TO 202406302359]'
+  );
+  assert.equal(
+    buildArxivDiscoverQuery("ssm", { from: "2023-01-01", to: "2024-06-30" }),
+    'all:"ssm" AND submittedDate:[202301010000 TO 202406302359]'
+  );
+});
+
+test("searchScholarly maps discover filters to the exact upstream URL params", async () => {
+  const originalFetch = globalThis.fetch;
+  const seen = {};
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("https://export.arxiv.org/")) { seen.arxiv = u; return { ok: true, text: async () => "" }; }
+    if (u.includes("semanticscholar.org")) { seen.s2 = u; return { ok: true, json: async () => ({ data: [] }) }; }
+    if (u.includes("openalex.org")) { seen.oa = u; return { ok: true, json: async () => ({ results: [] }) }; }
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+  try {
+    const filters = normalizeDiscoverFilters({
+      from: "2023-01-01", to: "2024-12-31", sort: "newest", openAccess: true,
+      venue: "NeurIPS", category: "cs.CL", perSource: 5,
+    });
+    await searchScholarly({ plainQuery: "state space models", perSource: filters.perSource, filters });
+
+    const arx = new URL(seen.arxiv);
+    assert.equal(
+      arx.searchParams.get("search_query"),
+      'all:"state space models" AND cat:cs.CL AND submittedDate:[202301010000 TO 202412312359]'
+    );
+    assert.equal(arx.searchParams.get("sortBy"), "submittedDate"); // sort=newest
+    assert.equal(arx.searchParams.get("max_results"), "5");
+
+    const s2 = new URL(seen.s2);
+    assert.equal(s2.searchParams.get("publicationDateOrYear"), "2023-01-01:2024-12-31");
+    assert.ok(s2.searchParams.has("openAccessPdf")); // bare flag param
+    assert.equal(s2.searchParams.get("venue"), "NeurIPS");
+    assert.match(s2.searchParams.get("fields"), /venue,isOpenAccess,openAccessPdf/);
+
+    const oa = new URL(seen.oa);
+    assert.equal(
+      oa.searchParams.get("filter"),
+      "from_publication_date:2023-01-01,to_publication_date:2024-12-31,is_oa:true"
+    );
+    assert.equal(oa.searchParams.get("sort"), "publication_date:desc");
+    assert.match(oa.searchParams.get("select"), /primary_location/);
+
+    // Open date ends and relevance sort: no filter leftovers.
+    seen.arxiv = seen.s2 = seen.oa = "";
+    await searchScholarly({ plainQuery: "ssm", perSource: 5, filters: normalizeDiscoverFilters({ from: "2023-01-01" }) });
+    assert.equal(new URL(seen.s2).searchParams.get("publicationDateOrYear"), "2023-01-01:");
+    assert.equal(new URL(seen.oa).searchParams.get("filter"), "from_publication_date:2023-01-01");
+    assert.equal(new URL(seen.oa).searchParams.get("sort"), null);
+    assert.equal(new URL(seen.arxiv).searchParams.get("sortBy"), "relevance");
+    assert.ok(!new URL(seen.s2).searchParams.has("openAccessPdf"));
+
+    // Author maps to arXiv's au: clause AND OpenAlex's native author filter.
+    seen.arxiv = seen.s2 = seen.oa = "";
+    await searchScholarly({ plainQuery: "ssm", perSource: 5, filters: normalizeDiscoverFilters({ author: "Tri Dao" }) });
+    assert.match(new URL(seen.arxiv).searchParams.get("search_query"), /au:"Tri Dao"/);
+    assert.equal(new URL(seen.oa).searchParams.get("filter"), "raw_author_name.search:Tri Dao");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("applyDiscoverPostFilters enforces author/venue/date/openAccess on the merged pool", () => {
+  const papers = [
+    { title: "A", authors: "Jane Roe, Max Mustermann", venue: "NeurIPS 2024", date: "2024-06-01", isOpenAccess: true },
+    { title: "B", authors: "Someone Else", venue: "ICML", date: "2022-01-01", isOpenAccess: false },
+    { title: "C", authors: "Jane Roe", venue: null, date: "", isOpenAccess: null },
+    { title: "D", authors: "jane roe", venue: "Workshop @ NeurIPS", date: "2023", isOpenAccess: null },
+  ];
+  assert.deepEqual(applyDiscoverPostFilters(papers, {}).map((p) => p.title), ["A", "B", "C", "D"]);
+  assert.deepEqual(applyDiscoverPostFilters(papers, { author: "Jane Roe" }).map((p) => p.title), ["A", "C", "D"]);
+  // An unknown venue (arXiv reports none) is never a provable violation.
+  assert.deepEqual(applyDiscoverPostFilters(papers, { venue: "neurips" }).map((p) => p.title), ["A", "C", "D"]);
+  // Date range: missing dates pass; a year-only date is dropped only when
+  // provably outside the window.
+  assert.deepEqual(applyDiscoverPostFilters(papers, { from: "2023-01-01" }).map((p) => p.title), ["A", "C", "D"]);
+  assert.deepEqual(applyDiscoverPostFilters(papers, { to: "2022-12-31" }).map((p) => p.title), ["B", "C"]);
+  assert.deepEqual(applyDiscoverPostFilters(papers, { from: "2024-01-01", to: "2024-12-31" }).map((p) => p.title), ["A", "C"]);
+  // openAccess drops only papers KNOWN to be closed.
+  assert.deepEqual(applyDiscoverPostFilters(papers, { openAccess: true }).map((p) => p.title), ["A", "C", "D"]);
+});
+
+test("author post-filter never drops a paper whose author list is truncated to 'et al.'", () => {
+  // All three normalizers collapse >2 authors to "First et al.", so a match
+  // against the co-author list can never be proven absent — those papers pass
+  // (arXiv's au: and OpenAlex's raw_author_name.search enforce it natively).
+  const papers = [
+    { title: "first-author", authors: "Tri Dao et al." },
+    { title: "hidden-coauthor", authors: "Albert Gu et al." },
+    { title: "full-list-miss", authors: "Jane Roe, Max Mustermann" },
+    { title: "full-list-hit", authors: "Someone Else, Tri Dao" },
+    { title: "unknown-authors", authors: "Unknown" },
+  ];
+  assert.deepEqual(
+    applyDiscoverPostFilters(papers, { author: "Tri Dao" }).map((p) => p.title),
+    ["first-author", "hidden-coauthor", "full-list-hit", "unknown-authors"]
+  );
+});
+
+test("sortDiscoverPapers orders by date or citations with unknowns last", () => {
+  const papers = [
+    { title: "old", date: "2020-01-01", citations: 500 },
+    { title: "undated", date: "", citations: 0 },
+    { title: "new", date: "2024-06-01", citations: null },
+  ];
+  assert.deepEqual(sortDiscoverPapers(papers, "newest").map((p) => p.title), ["new", "old", "undated"]);
+  assert.deepEqual(sortDiscoverPapers(papers, "citations").map((p) => p.title), ["old", "undated", "new"]);
+  // relevance (or anything else) keeps the merge order and copies the array.
+  const kept = sortDiscoverPapers(papers, "relevance");
+  assert.deepEqual(kept.map((p) => p.title), ["old", "undated", "new"]);
+  assert.notEqual(kept, papers);
+});
+
+test("mergeScholarly backfills venue, isOpenAccess, and pdfUrl from later duplicates", () => {
+  const arx = {
+    title: "Selective State Spaces", url: "http://arxiv.org/abs/2312.00752v1",
+    abstract: "", doi: "", date: "", citations: null, source: "arxiv",
+    venue: null, isOpenAccess: null, pdfUrl: null,
+  };
+  const s2 = {
+    title: "Selective State Spaces", url: "https://arxiv.org/abs/2312.00752",
+    abstract: "abs", doi: "10.48550/arxiv.2312.00752", date: "2023-12-01", citations: 450, source: "semanticscholar",
+    venue: "NeurIPS", isOpenAccess: false, pdfUrl: "https://example.org/paper.pdf",
+  };
+  const [merged] = mergeScholarly([[arx], [s2]]);
+  assert.equal(merged.source, "arxiv"); // first occurrence wins
+  assert.equal(merged.venue, "NeurIPS");
+  assert.equal(merged.isOpenAccess, false); // null is backfilled even by a false
+  assert.equal(merged.pdfUrl, "https://example.org/paper.pdf");
 });
 
 test("searchScholarly merges three live sources and isolates failures", async () => {

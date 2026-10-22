@@ -23,10 +23,14 @@ out of scope (e.g. code execution — never claim an experiment ran).
   CSS as a template literal). Do not split it. Modes: Digest, Research, Lab,
   Studio, plus an auth gate (`sessionStorage.pb_auth_entered` skips it).
 - `api/agent.js` — SSE endpoint; actions: `research`, `chat`, `ingest`,
-  `compose`, `lab`. `api/chat.js` — plain completions proxy.
+  `compose`, `lab`, `collection`, plus the non-SSE `discover` (filtered
+  multi-source search, plain JSON like `ingest`). `api/chat.js` — plain
+  completions proxy.
 - `api/_lib/`: `graph.js` (research + chat graphs), `lab.js` (9-agent
-  investigation), `compose.js` (article pipeline), `scholar.js` (Semantic
-  Scholar + OpenAlex + merge), `arxiv.js`, `ingest.js` (SSRF guard),
+  investigation), `compose.js` (article pipeline), `collection.js`
+  (collection analysis: themes/concepts → comparison → cited brief),
+  `scholar.js` (Semantic Scholar + OpenAlex + merge + discover filters),
+  `arxiv.js`, `ingest.js` (SSRF guard),
   `auth.js`, `model.js`, `text.js` (pure helpers incl. `verifyQuote`).
 
 ## Conventions

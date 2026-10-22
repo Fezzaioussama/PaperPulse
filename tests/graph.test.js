@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   pickRelevant, decideNext, normalizeThemes, resolveLimits,
-  buildResearchGraph, lookupKnowledge,
+  buildResearchGraph, lookupKnowledge, buildChatSystemPrompt,
   sanitizeReportCitations, normalizeConcepts, normalizeCritique, normalizePractice,
   normalizeComparison, decideReview,
 } from "../api/_lib/graph.js";
@@ -234,4 +234,39 @@ test("lookupKnowledge returns lexical matches across papers, ideas, and themes",
   assert.ok(hit.matches.length >= 2);
   const none = JSON.parse(lookupKnowledge(knowledge, "quantum chemistry"));
   assert.equal(none.matches.length, 0);
+});
+
+test("knowledge collections are searched by lookupKnowledge and listed in the digest", () => {
+  const knowledge = {
+    runs: [],
+    collections: [
+      {
+        name: "Efficient attention",
+        papers: [
+          { title: "KV Cache Compression", abstract: "compressing transformer caches", authors: "J. Roe", date: "2024-06-01", venue: "ICML" },
+          { title: "Unrelated Botany Paper", abstract: "plants" },
+        ],
+      },
+      { name: "no papers array" }, // defensive: client-supplied shape
+      "not an object",
+      { papers: [{ title: "nameless collection" }] },
+    ],
+  };
+  const hits = JSON.parse(lookupKnowledge(knowledge, "kv cache compression")).matches;
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].kind, "collection paper");
+  assert.equal(hits[0].collection, "Efficient attention"); // hit tagged with its collection
+  assert.equal(hits[0].title, "KV Cache Compression");
+
+  const prompt = buildChatSystemPrompt(knowledge);
+  assert.ok(prompt.includes('Collection: "Efficient attention"'));
+  assert.ok(prompt.includes("[1] KV Cache Compression"));
+  assert.ok(prompt.includes("[2] Unrelated Botany Paper"));
+  // Digest caps at 40 titles per collection.
+  const big = {
+    collections: [{ name: "Big", papers: Array.from({ length: 60 }, (_, i) => ({ title: `Paper ${i + 1}` })) }],
+  };
+  const bigPrompt = buildChatSystemPrompt(big);
+  assert.ok(bigPrompt.includes("[40] Paper 40"));
+  assert.ok(!bigPrompt.includes("Paper 41"));
 });

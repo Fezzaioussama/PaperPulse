@@ -112,6 +112,9 @@ const LS = {
   knowledge: "pb_knowledge",
   studio: "pb_studio",
   articles: "pb_articles",
+  catalogs: "pb_catalogs",
+  searches: "pb_searches",
+  reader: "pb_reader",
 };
 
 const TODAY = new Date().toLocaleDateString("en-US", {
@@ -129,7 +132,22 @@ const getJSON = (k, fallback) => {
   try { const v = localStorage.getItem(k); return v == null ? fallback : JSON.parse(v); }
   catch { return fallback; }
 };
-const setJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+// Quota failures must not be silent: a "saved" toast over a write that never
+// landed is a lie. The app root registers a notifier (a toast); it is
+// throttled so one burst of failing writes surfaces once, not per key.
+let onStorageWriteError = null;
+let lastStorageErrorAt = 0;
+const setJSON = (k, v) => {
+  try { localStorage.setItem(k, JSON.stringify(v)); return true; }
+  catch {
+    const now = Date.now();
+    if (now - lastStorageErrorAt > 8000) {
+      lastStorageErrorAt = now;
+      onStorageWriteError?.(k);
+    }
+    return false;
+  }
+};
 
 // Credentials live only in this tab's memory; erase keys saved by older versions.
 try { localStorage.removeItem(LS.key); } catch {}
@@ -197,7 +215,7 @@ const apiCall = (prompt, maxTokens = 10000) =>
 // ── research agent transport: POST /api/agent, then read SSE events. ──
 // Unlike chatCall, browser-key mode still goes through /api/agent (the
 // LangGraph graph runs server-side); the key is only forwarded to OpenRouter.
-async function agentCall({ action, topic, objective, messages, knowledge, mode, goal, materials, style, outline, options, onEvent, signal }) {
+async function agentCall({ action, topic, objective, messages, knowledge, mode, goal, materials, style, outline, name, papers, options, onEvent, signal }) {
   const apiKey = getApiKey();
   const res = await fetch("/api/agent", {
     method: "POST",
@@ -208,7 +226,7 @@ async function agentCall({ action, topic, objective, messages, knowledge, mode, 
         : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
     },
     body: JSON.stringify({
-      action, topic, objective, messages, knowledge, mode, goal, materials, style, outline,
+      action, topic, objective, messages, knowledge, mode, goal, materials, style, outline, name, papers,
       options: { ...(options || {}), ...(apiKey ? { model: getModel() } : {}) },
     }),
     signal,
@@ -527,6 +545,254 @@ async function ingestCall(url) {
   return data; // {title, text, origin}
 }
 
+// ── Discover: filtered multi-source search + catalogs + saved searches ──
+
+// Server-side filtered literature search (arXiv + Semantic Scholar +
+// OpenAlex, merged and deduped). Plain JSON, no SSE, no LLM call.
+async function discoverCall(query, filters, signal) {
+  const apiKey = getApiKey();
+  const res = await fetch("/api/agent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey
+        ? { "X-OpenRouter-Key": apiKey }
+        : (serverAccessToken ? { "Authorization": `Bearer ${serverAccessToken}` } : {})),
+    },
+    body: JSON.stringify({ action: "discover", query, filters }),
+    signal,
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `Server API status ${res.status}.`);
+  return data; // {papers, counts, filters}
+}
+
+// Guest fallback: a mechanical arXiv query mirroring the server's
+// buildArxivDiscoverQuery (all:"q" + cat: + au: + submittedDate:[...]).
+function buildGuestArxivQuery(query, filters = {}) {
+  const q = compactText(query);
+  const clauses = [/\b(all|ti|abs|cat):/i.test(q) ? q : `all:"${q.replace(/"/g, "")}"`];
+  if (filters.category) clauses.push(`cat:${filters.category}`);
+  if (filters.author) clauses.push(`au:"${filters.author.replace(/"/g, "")}"`);
+  if (filters.from || filters.to) {
+    const from = filters.from ? filters.from.replace(/-/g, "") : "19910101";
+    const to = filters.to ? filters.to.replace(/-/g, "") : "20991231";
+    clauses.push(`submittedDate:[${from}0000 TO ${to}2359]`);
+  }
+  return clauses.join(" AND ");
+}
+
+// Client-side sort for the guest (arXiv-only) result list; mirrors the
+// server's sortDiscoverPapers (missing dates / counts sort last).
+function sortDiscoverClient(papers, sort) {
+  const list = [...papers];
+  if (sort === "newest") return list.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+  if (sort === "citations") return list.sort((a, b) => (b.citations ?? -1) - (a.citations ?? -1));
+  return list;
+}
+
+const isoDaysAgo = (days) => new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+// One-line summary of a discover filter set for saved-search rows.
+function describeDiscoverFilters(f = {}) {
+  const parts = [];
+  if (f.from || f.to) parts.push(`${f.from || "…"} → ${f.to || "…"}`);
+  if (f.sort && f.sort !== "relevance") parts.push(f.sort);
+  if (f.openAccess) parts.push("open access");
+  if (f.author) parts.push(`au: ${f.author}`);
+  if (f.venue) parts.push(`venue: ${f.venue}`);
+  if (f.category) parts.push(f.category);
+  return parts.length ? parts.join(" · ") : "no filters";
+}
+
+// User catalogs ({name, query, filters}) and saved searches, both capped.
+const CATALOGS_LIMIT = 20;
+const SEARCHES_LIMIT = 20;
+
+function readCatalogs() {
+  const list = getJSON(LS.catalogs, []);
+  return Array.isArray(list) ? list.filter(c => c && c.name && typeof c.query === "string") : [];
+}
+function saveCatalogs(list) {
+  const capped = list.slice(0, CATALOGS_LIMIT);
+  setJSON(LS.catalogs, capped);
+  return capped;
+}
+
+function readSearches() {
+  const list = getJSON(LS.searches, []);
+  return Array.isArray(list) ? list.filter(s => s && s.id && typeof s.query === "string") : [];
+}
+function saveSearches(list) {
+  const capped = list.slice(0, SEARCHES_LIMIT);
+  setJSON(LS.searches, capped);
+  return capped;
+}
+
+// ── Collections: curated paper sets under the pb_knowledge umbrella.
+//    Foundation for the Knowledge mode — storage + add/dedupe only. ──
+const COLLECTIONS_LIMIT = 12;
+const COLLECTION_PAPERS_LIMIT = 50;
+
+function readCollections() {
+  const all = readKnowledge();
+  return Array.isArray(all.collections) ? all.collections : [];
+}
+
+function saveCollections(collections) {
+  const all = readKnowledge();
+  const capped = collections.slice(0, COLLECTIONS_LIMIT);
+  setJSON(LS.knowledge, { ...all, collections: capped });
+  return capped;
+}
+
+// Compact a paper (discover/agent shape) into its stored collection form.
+function collectionPaperFromPaper(p) {
+  return {
+    key: agentPaperKey(p),
+    title: p.title || "",
+    authors: p.authors || "",
+    date: p.date || "",
+    url: p.url || "",
+    abstract: clipText(p.abstract || "", 600),
+    venue: p.venue || null,
+    citations: p.citations ?? null,
+    doi: p.doi || null,
+    pdfUrl: p.pdfUrl || null,
+    source: p.source || "",
+  };
+}
+
+// Add papers to a collection by id — or create one when given a new name.
+// Dedupes by agentPaperKey; returns {collections, collection, added, full}.
+function addPapersToCollection(collectionIdOrNewName, papers) {
+  const collections = readCollections();
+  const existing = collections.find(c => c.id === collectionIdOrNewName);
+  let next;
+  if (existing) {
+    next = collections.map(c => (c.id === existing.id ? { ...c, papers: [...(c.papers || [])] } : c));
+  } else {
+    const name = String(collectionIdOrNewName || "").trim().slice(0, 80);
+    if (!name) return { collections, collection: null, added: 0 };
+    if (collections.length >= COLLECTIONS_LIMIT) return { collections, collection: null, added: 0, full: true };
+    next = [{ id: newId("col"), name, createdAt: new Date().toISOString(), papers: [] }, ...collections];
+  }
+  const target = existing ? next.find(c => c.id === existing.id) : next[0];
+  const have = new Set(target.papers.map(p => p.key));
+  let added = 0;
+  for (const p of papers || []) {
+    const rec = collectionPaperFromPaper(p);
+    if (!rec.key || have.has(rec.key)) continue;
+    if (target.papers.length >= COLLECTION_PAPERS_LIMIT) break;
+    target.papers.push(rec);
+    have.add(rec.key);
+    added++;
+  }
+  return { collections: saveCollections(next), collection: target, added };
+}
+
+// ── Knowledge mode helpers over the collections storage. Every write goes
+//    through saveCollections, so the 12-collection cap holds on all paths;
+//    papers are only ever added via addPapersToCollection (50-paper cap). ──
+
+// Papers sent to the server 'collection' analysis (its hard cap is 16).
+const COLLECTION_ANALYZE_LIMIT = 16;
+
+function createCollection(name) {
+  const collections = readCollections();
+  const clean = String(name || "").trim().slice(0, 80);
+  if (!clean) return { collections, collection: null };
+  if (collections.length >= COLLECTIONS_LIMIT) return { collections, collection: null, full: true };
+  const collection = { id: newId("col"), name: clean, createdAt: new Date().toISOString(), papers: [] };
+  return { collections: saveCollections([collection, ...collections]), collection };
+}
+
+function updateCollection(id, updater) {
+  return saveCollections(readCollections().map(c => (c.id === id ? updater(c) : c)));
+}
+
+function deleteCollection(id) {
+  return saveCollections(readCollections().filter(c => c.id !== id));
+}
+
+// Persist a server analysis on its collection; the brief is clipped exactly
+// like saveKnowledgeRun clips run reports so pb_knowledge stays bounded.
+function saveCollectionAnalysis(id, analysis) {
+  return updateCollection(id, c => ({
+    ...c,
+    analysis: { ...analysis, brief: String(analysis.brief || "").slice(0, 20000) },
+  }));
+}
+
+// Vector-index document id for one collected paper (browser RAG).
+const collectionDocId = (collectionId, paperKey) => `col:${collectionId}:${paperKey}`;
+
+// Index map for a collection's papers: the server's paperId mirrors
+// agentPaperKey, but map both the stored key and a fresh key to be safe.
+function collectionPaperIndex(papers) {
+  const idx = new Map();
+  (papers || []).forEach((p, i) => {
+    if (p.key) idx.set(p.key, i + 1);
+    idx.set(agentPaperKey(p), i + 1);
+  });
+  return idx;
+}
+
+// Full collection (papers + analysis) as one markdown document (export / copy).
+function buildCollectionMarkdown(collection) {
+  const cell = (s) => String(s || "").replace(/\|/g, "/");
+  const papers = collection.papers || [];
+  const a = collection.analysis || null;
+  const idx = collectionPaperIndex(papers);
+  const L = [`# Collection: ${collection.name}`, ""];
+  L.push(`_${(collection.createdAt || "").slice(0, 10)} · ${papers.length} papers${a ? ` · analyzed ${(a.finishedAt || "").slice(0, 10)}${a.partial ? " (partial)" : ""}` : ""}_`);
+  L.push("", "## Papers", "");
+  papers.forEach((p, i) => {
+    const meta = [p.authors, p.venue, p.date].filter(Boolean).join(", ");
+    L.push(`${i + 1}. ${p.url ? `[${p.title}](${p.url})` : p.title}${meta ? ` — ${meta}` : ""}${p.citations != null ? ` · ${p.citations} citations` : ""}`);
+  });
+  if (a?.themes?.length) {
+    L.push("", "## Cross-paper themes");
+    for (const t of a.themes) {
+      L.push("", `### ${t.name}`, "", t.summary);
+      if (t.agreements?.length) L.push(`- **Agree:** ${t.agreements.join("; ")}`);
+      if (t.contradictions?.length) L.push(`- **Diverge:** ${t.contradictions.join("; ")}`);
+    }
+  }
+  if (a?.concepts?.length) {
+    L.push("", "## Key concepts", "");
+    for (const c of a.concepts) L.push(`- **${c.name}** — ${c.explanation}`);
+  }
+  if (a?.comparison?.length) {
+    L.push("", "## Paper comparison", "",
+      "| Paper | Approach | Contribution | Evidence | Limitation |", "|---|---|---|---|---|");
+    for (const r of a.comparison) {
+      L.push(`| [${idx.get(r.paperId) || "?"}] | ${cell(r.approach)} | ${cell(r.contribution)} | ${cell(r.evidence)} | ${cell(r.limitation)} |`);
+    }
+  }
+  if (a?.brief) L.push("", "## Brief", "", a.brief);
+  return L.join("\n");
+}
+
+// RFC-4180 CSV quoting: wrap when the cell holds a comma, quote, or newline.
+function csvCell(value) {
+  const s = String(value ?? "");
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// The analysis comparison matrix as CSV rows joined with CRLF.
+function buildComparisonCsv(collection) {
+  const papers = collection.papers || [];
+  const idx = collectionPaperIndex(papers);
+  const rows = [["n", "title", "url", "approach", "contribution", "evidence", "limitation"]];
+  for (const r of collection.analysis?.comparison || []) {
+    const n = idx.get(r.paperId);
+    const p = n != null ? papers[n - 1] : null;
+    rows.push([n ?? "", p?.title || r.paperId, p?.url || "", r.approach || "", r.contribution || "", r.evidence || "", r.limitation || ""]);
+  }
+  return rows.map(row => row.map(csvCell).join(",")).join("\r\n");
+}
+
 // Full research briefing as one markdown document (export / copy).
 function buildResearchMarkdown(run) {
   const cell = (s) => String(s || "").replace(/\|/g, "/");
@@ -809,24 +1075,70 @@ function getPaperChatId(paper) {
   return normId(paper.url) || normalizeForMatch(paper.title).slice(0, 90) || "unknown";
 }
 
+// Evidence snapshot persisted with each assistant message: the chunks the
+// model was shown, selected mechanically BEFORE the LLM answered. A stored
+// entry is only kept when it still looks like one ({id:E#, chunkId, section,
+// text}); anything else is dropped, so pre-evidence histories load fine.
+const EVIDENCE_PER_MESSAGE = 8;
+
+function normalizeMessageEvidence(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    if (typeof item.id !== "string" || !/^E\d{1,2}$/.test(item.id)) continue;
+    if (typeof item.chunkId !== "string" || !item.chunkId.trim()) continue;
+    out.push({
+      id: item.id,
+      chunkId: item.chunkId.slice(0, 16),
+      section: typeof item.section === "string" ? item.section.slice(0, 90) : "",
+      text: typeof item.text === "string" ? item.text.slice(0, 320) : "",
+    });
+    if (out.length >= EVIDENCE_PER_MESSAGE) break;
+  }
+  return out.length ? out : null;
+}
+
+function normalizeChatMessages(messages) {
+  return messages
+    .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .slice(-CHAT_HISTORY_LIMIT)
+    .map(m => {
+      const evidence = m.role === "assistant" ? normalizeMessageEvidence(m.evidence) : null;
+      return evidence
+        ? { role: m.role, content: m.content.slice(0, 5000), evidence }
+        : { role: m.role, content: m.content.slice(0, 5000) };
+    });
+}
+
 function readPaperChatHistory(paper) {
   const all = getJSON(LS.chats, {});
   const id = getPaperChatId(paper);
   const messages = Array.isArray(all[id]) ? all[id] : [];
-  return messages
-    .filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-CHAT_HISTORY_LIMIT);
+  return normalizeChatMessages(messages);
 }
 
 function savePaperChatHistory(paper, messages) {
   const all = getJSON(LS.chats, {});
   const id = getPaperChatId(paper);
-  const clean = messages
-    .filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-CHAT_HISTORY_LIMIT)
-    .map(m => ({ role: m.role, content: m.content.slice(0, 5000) }));
-  setJSON(LS.chats, { ...all, [id]: clean });
+  setJSON(LS.chats, { ...all, [id]: normalizeChatMessages(messages) });
 }
+
+// ── reader workspace preferences (pb_reader): pane split %, which side the
+//    document sits on, and the active document tab ──
+const READER_DEFAULT_PREFS = { split: 52, side: "left", view: "text" };
+
+function normalizeReaderPrefs(raw) {
+  const p = raw && typeof raw === "object" ? raw : {};
+  const split = Number(p.split);
+  return {
+    split: Number.isFinite(split) ? Math.min(75, Math.max(25, Math.round(split))) : READER_DEFAULT_PREFS.split,
+    side: p.side === "right" ? "right" : "left",
+    view: p.view === "pdf" ? "pdf" : "text",
+  };
+}
+
+const readReaderPrefs = () => normalizeReaderPrefs(getJSON(LS.reader, null));
 
 function splitIntoSections(text = "") {
   const lines = String(text).split(/\n+/).map(line => line.trim()).filter(Boolean);
@@ -916,6 +1228,21 @@ function buildPaperChunks(paper, fullText) {
     chunkId: `C${index + 1}`,
     searchText: normalizeForMatch(`${chunk.label} ${chunk.text}`),
   }));
+}
+
+// Resolve a stored evidence snapshot against THIS session's chunks. Chunk ids
+// are positional (C#) over whatever text loaded when the answer was produced;
+// today's text can chunk differently, so the id is trusted only while its
+// chunk still carries the quoted snippet. Otherwise the snippet's new home is
+// looked up — and "" (no jump) beats flashing unrelated text as if cited.
+function resolveEvidenceChunk(chunks, entry) {
+  if (!entry?.chunkId) return "";
+  const stored = normalizeForMatch(String(entry.text || "").replace(/ \.\.\.$/, "")).slice(0, 120);
+  if (!stored) return entry.chunkId; // legacy snapshot without text: trust the id
+  const target = chunks.find(c => c.chunkId === entry.chunkId);
+  if (target && target.searchText.includes(stored)) return entry.chunkId;
+  const moved = chunks.find(c => c.searchText.includes(stored));
+  return moved ? moved.chunkId : "";
 }
 
 function queryTokensForRetrieval(query = "") {
@@ -1524,15 +1851,24 @@ function parseArxivXml(xml) {
   }).filter(p => p.title && p.abstract);
 }
 
-async function fetchArxiv(query, count, sortBy = "submittedDate") {
+// Returns null when the fetch itself failed (network/CORS and both proxies
+// down) — distinct from a successful query with zero matches ([]). Guest
+// Discover needs the distinction; other callers use fetchArxiv below, which
+// coerces null to [] and keeps the old graceful-degradation contract.
+async function fetchArxivOrNull(query, count, sortBy = "submittedDate") {
   const sort = sortBy === "relevance" ? "relevance" : "submittedDate";
   const apiUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(query)}&sortBy=${sort}&sortOrder=descending&max_results=${count}`;
   const xml = await fetchWithProxies(apiUrl);
-  if (xml && xml.includes("<entry")) {
+  if (xml === null) return null;
+  if (xml.includes("<entry")) {
     const parsed = parseArxivXml(xml);
     if (parsed.length) return parsed;
   }
   return [];
+}
+
+async function fetchArxiv(query, count, sortBy = "submittedDate") {
+  return (await fetchArxivOrNull(query, count, sortBy)) || [];
 }
 
 // ── Hugging Face Daily Papers (community-upvoted "what's hot today") ──
@@ -1793,7 +2129,11 @@ const CHAT_FOLLOWUPS = [
   "Explain the experiments",
 ];
 
-function renderInlineText(text) {
+// Inline markdown-lite renderer. `citeMap` (id → evidence entry) and `onCite`
+// are optional: without them [E#] renders as the plain badge it always was.
+// With a citeMap, a KNOWN id becomes a clickable chip that jumps to its source
+// chunk, and an unknown id is mechanically marked unverified — never clickable.
+function renderInlineText(text, citeMap, onCite) {
   const nodes = [];
   const re = /(\*\*[^*]+\*\*|`[^`]+`|\[E\d+\])/g;
   let last = 0;
@@ -1805,6 +2145,23 @@ function renderInlineText(text) {
       nodes.push(<strong key={nodes.length}>{token.slice(2, -2)}</strong>);
     } else if (token.startsWith("`")) {
       nodes.push(<code key={nodes.length} className="chat-inline-code">{token.slice(1, -1)}</code>);
+    } else if (citeMap) {
+      const entry = citeMap.get(token.slice(1, -1));
+      if (entry && onCite) {
+        nodes.push(
+          <span
+            key={nodes.length}
+            className="chat-cite clickable"
+            role="button"
+            tabIndex={0}
+            title={`Jump to “${entry.section || "source"}” in the paper`}
+            onClick={() => onCite(entry)}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onCite(entry); } }}
+          >{token}</span>
+        );
+      } else {
+        nodes.push(<span key={nodes.length} className="chat-cite unverified" title="unverified citation">{token}</span>);
+      }
     } else {
       nodes.push(<span key={nodes.length} className="chat-cite">{token}</span>);
     }
@@ -1814,7 +2171,7 @@ function renderInlineText(text) {
   return nodes.map((node, i) => typeof node === "string" ? <span key={i}>{node}</span> : node);
 }
 
-function MessageContent({ content }) {
+function MessageContent({ content, citeMap, onCite }) {
   const lines = String(content || "").split(/\n/);
   const blocks = [];
   let i = 0;
@@ -1829,7 +2186,7 @@ function MessageContent({ content }) {
         items.push(lines[i].trim().replace(/^[-*]\s+/, ""));
         i++;
       }
-      blocks.push(<ul key={blocks.length}>{items.map((item, idx) => <li key={idx}>{renderInlineText(item)}</li>)}</ul>);
+      blocks.push(<ul key={blocks.length}>{items.map((item, idx) => <li key={idx}>{renderInlineText(item, citeMap, onCite)}</li>)}</ul>);
       continue;
     }
 
@@ -1839,7 +2196,7 @@ function MessageContent({ content }) {
         items.push(lines[i].trim().replace(/^\d+[.)]\s+/, ""));
         i++;
       }
-      blocks.push(<ol key={blocks.length}>{items.map((item, idx) => <li key={idx}>{renderInlineText(item)}</li>)}</ol>);
+      blocks.push(<ol key={blocks.length}>{items.map((item, idx) => <li key={idx}>{renderInlineText(item, citeMap, onCite)}</li>)}</ol>);
       continue;
     }
 
@@ -1853,16 +2210,101 @@ function MessageContent({ content }) {
       paragraph.push(lines[i].trim());
       i++;
     }
-    blocks.push(<p key={blocks.length}>{renderInlineText(paragraph.join(" "))}</p>);
+    blocks.push(<p key={blocks.length}>{renderInlineText(paragraph.join(" "), citeMap, onCite)}</p>);
   }
 
-  return <>{blocks.length ? blocks : <p>{renderInlineText(content)}</p>}</>;
+  return <>{blocks.length ? blocks : <p>{renderInlineText(content, citeMap, onCite)}</p>}</>;
 }
 
 // AI-native typing indicator: 3-dot pulse shown while an agent is working.
 const Dots = () => (
   <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
 );
+
+// Keyboard-accessible evidence chip shared by inline citations and the
+// per-message evidence row; clicking it jumps the document pane to the chunk.
+function EvidenceChip({ entry, onCite }) {
+  return (
+    <span
+      className="chat-cite clickable"
+      role="button"
+      tabIndex={0}
+      title={`Jump to “${entry.section || "source"}” in the paper`}
+      onClick={() => onCite(entry)}
+      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onCite(entry); } }}
+    >[{entry.id}]</span>
+  );
+}
+
+// Collapsible "Evidence (n)" row under an assistant message: the exact
+// snippets the model was shown (selected mechanically before the LLM ran).
+function EvidenceRow({ evidence, onCite }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="evidence-row">
+      <button type="button" className="evidence-toggle" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+        <span className="evidence-caret" aria-hidden="true">{open ? "▾" : "▸"}</span> Evidence ({evidence.length})
+      </button>
+      {open && (
+        <ul className="evidence-list">
+          {evidence.map(e => (
+            <li key={e.id} className="evidence-item">
+              <EvidenceChip entry={e} onCite={onCite} />
+              <span className="evidence-snippet">
+                {e.section && <strong className="evidence-section">{e.section}: </strong>}
+                {e.text}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// Document pane, Text tab: the paper rendered as sections of the SAME chunks
+// the retriever cites, so every pbchunk-<id> anchor a citation can point at
+// exists in the DOM. Never blank: the abstract/metadata chunk always renders.
+function ReaderTextView({ chunks, reading, fullText, fullTextError, flashChunk, externalUrl }) {
+  const sections = useMemo(() => {
+    const groups = [];
+    for (const chunk of chunks) {
+      const label = chunk.kind === "full-text" ? chunk.label.replace(/\s\d+$/, "") : chunk.label;
+      const last = groups[groups.length - 1];
+      if (last && last.label === label) last.chunks.push(chunk);
+      else groups.push({ label, chunks: [chunk] });
+    }
+    return groups;
+  }, [chunks]);
+
+  return (
+    <div className="reader-doc-scroll">
+      {!reading && !fullText && (
+        <div className="chat-notice warn reader-doc-note">
+          <span>{fullTextError || "Full text could not be loaded."} Showing the abstract and available summaries instead.</span>
+          {externalUrl && <a href={externalUrl} target="_blank" rel="noreferrer">Open the paper ↗</a>}
+        </div>
+      )}
+      {sections.map((sec, i) => (
+        <section key={`${sec.label}-${i}`} className="reader-section">
+          <h3 className="reader-section-title">{sec.label}</h3>
+          {sec.chunks.map(c => (
+            <p
+              key={c.chunkId}
+              id={`pbchunk-${c.chunkId}`}
+              className={`reader-chunk${c.chunkId === flashChunk ? " flash" : ""}`}
+            >{c.text}</p>
+          ))}
+        </section>
+      ))}
+      {reading && (
+        <div className="reader-skeleton" role="status" aria-label="Loading full paper text">
+          {[0, 1, 2, 3, 4, 5].map(i => <span key={i} style={{ animationDelay: `${i * 90}ms` }} />)}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ChatModal({ paper, onClose }) {
   const [messages, setMessages] = useState(() => readPaperChatHistory(paper));
@@ -1872,16 +2314,34 @@ function ChatModal({ paper, onClose }) {
   const [fullTextError, setFullTextError] = useState("");
   const [reading, setReading] = useState(true);
   const [allowSummaryOnly, setAllowSummaryOnly] = useState(false);
+  const [prefs, setPrefs] = useState(() => readReaderPrefs()); // {split, side, view} → pb_reader
+  const [maximized, setMaximized] = useState(null);            // "doc" | "chat" | null (per open)
+  const [pdfMounted, setPdfMounted] = useState(false);         // iframe mounts on first PDF tab visit
+  const [flashChunk, setFlashChunk] = useState("");            // chunkId wearing the highlight flash
+  const [collectOpen, setCollectOpen] = useState(false);
+  const [collectNote, setCollectNote] = useState("");
   const bodyRef = useRef(null);
   const inputRef = useRef(null);
+  const panesRef = useRef(null);
   const paperChatId = useMemo(() => getPaperChatId(paper), [paper]);
 
-  // close on Escape
+  const arxivId = useMemo(() => {
+    const id = normId(paper.url);
+    return /^\d{4}\.\d{4,5}$/.test(id) ? id : "";
+  }, [paper]);
+  const view = prefs.view === "pdf" && arxivId ? "pdf" : "text";
+  const externalUrl = arxivId
+    ? `https://arxiv.org/abs/${arxivId}`
+    : paper.doi ? `https://doi.org/${paper.doi}` : (paper.url || "");
+  const externalLabel = arxivId ? "arXiv" : paper.doi ? "DOI" : "Source";
+  const byline = [paper.authors, (paper.date || "").slice(0, 10), paper.venue].filter(Boolean).join(" · ");
+
+  // close on Escape (an open collection picker handles its own Escape first)
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e) => { if (e.key === "Escape" && !collectOpen) onClose(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, collectOpen]);
 
   useEffect(() => {
     setMessages(readPaperChatHistory(paper));
@@ -1889,31 +2349,70 @@ function ChatModal({ paper, onClose }) {
     setFullText("");
     setFullTextError("");
     setAllowSummaryOnly(false);
+    setPdfMounted(false);
+    setFlashChunk("");
+    setCollectOpen(false);
+    setCollectNote("");
+    setMaximized(null);
   }, [paper, paperChatId]);
 
-  // ingest the paper's full text once; abstract + summary are the fallback context
+  // Full text, cached in state per open. With a credential the server ingest
+  // runs first (arXiv ids and URLs both pass the SSRF guard server-side);
+  // guests — and any ingest failure — use the CORS-proxy path.
   useEffect(() => {
     let cancelled = false;
     setReading(true);
     setFullText("");
     setFullTextError("");
-    fetchPaperText(paper)
-      .then(text => {
-        if (cancelled) return;
-        setFullText(text);
-        if (!text) setFullTextError("Full paper text could not be loaded. Answers will use the abstract and generated briefing summary.");
-      })
-      .catch(() => {
-        if (!cancelled) setFullTextError("Full paper text could not be loaded. Answers will use the abstract and generated briefing summary.");
-      })
+    const failNote = "Full paper text could not be loaded. Answers will use the abstract and generated briefing summary.";
+    (async () => {
+      let text = "";
+      // No id and no url means nothing the ingest endpoint could ever fetch —
+      // skip the guaranteed-to-fail round-trip.
+      if ((browserApiKey || serverAccessToken) && (arxivId || paper.url)) {
+        try {
+          const data = await ingestCall(arxivId || paper.url);
+          if (typeof data?.text === "string" && data.text.trim().length > 500) {
+            text = data.text.slice(0, FULLTEXT_LIMIT);
+          }
+        } catch (_) { /* best-effort; the proxy path follows */ }
+      }
+      if (!text && !cancelled) text = await fetchPaperText(paper).catch(() => "");
+      if (cancelled) return;
+      setFullText(text || "");
+      if (!text) setFullTextError(failNote);
+    })()
+      .catch(() => { if (!cancelled) setFullTextError(failNote); })
       .finally(() => { if (!cancelled) setReading(false); });
     const focusTimer = setTimeout(() => inputRef.current?.focus(), 0);
     return () => { cancelled = true; clearTimeout(focusTimer); };
-  }, [paper, paperChatId]);
+  }, [paper, paperChatId, arxivId]);
 
   useEffect(() => {
     savePaperChatHistory(paper, messages);
   }, [paper, paperChatId, messages]);
+
+  // persist reader prefs (debounced: the divider drag updates split rapidly)
+  useEffect(() => {
+    const t = setTimeout(() => setJSON(LS.reader, prefs), 150);
+    return () => clearTimeout(t);
+  }, [prefs]);
+
+  // mount the PDF iframe lazily, on the first visit to the PDF tab
+  useEffect(() => { if (view === "pdf") setPdfMounted(true); }, [view]);
+
+  // the citation flash is transient
+  useEffect(() => {
+    if (!flashChunk) return;
+    const t = setTimeout(() => setFlashChunk(""), 1800);
+    return () => clearTimeout(t);
+  }, [flashChunk]);
+
+  useEffect(() => {
+    if (!collectNote) return;
+    const t = setTimeout(() => setCollectNote(""), 2600);
+    return () => clearTimeout(t);
+  }, [collectNote]);
 
   // autoscroll to the newest message
   useEffect(() => {
@@ -1926,6 +2425,50 @@ function ChatModal({ paper, onClose }) {
   const chatStatus = reading
     ? allowSummaryOnly ? "Using abstract + summary while full text loads" : "Reading and indexing the full paper..."
     : fullText ? `Full text indexed (${fullTextChunks} evidence chunks)` : "Using abstract + summary context";
+
+  // A citation click: re-verify the chunk still holds the stored snippet
+  // (ids are positional; a later session's text can chunk differently), then
+  // show the Text tab, scroll the chunk into view, and flash it.
+  const jumpToChunk = useCallback((entry) => {
+    const chunkId = resolveEvidenceChunk(paperChunks, entry);
+    if (!chunkId) {
+      if (entry?.chunkId) setCollectNote("That snippet came from an earlier load of this paper — it has no matching spot in today's text.");
+      return;
+    }
+    setPrefs(p => (p.view === "text" ? p : { ...p, view: "text" }));
+    setMaximized(m => (m === "chat" ? null : m));
+    setFlashChunk(""); // drop the class first so re-citing the same chunk re-flashes
+    setTimeout(() => {
+      const el = document.getElementById(`pbchunk-${chunkId}`);
+      if (!el) return;
+      const reduced = typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "center" });
+      setFlashChunk(chunkId);
+    }, 60);
+  }, [paperChunks]);
+
+  // Draggable divider (pointer events, clamped 25..75% for the doc pane).
+  const onDividerDown = useCallback((e) => {
+    const rect = panesRef.current?.getBoundingClientRect();
+    if (!rect || !rect.width) return;
+    e.preventDefault();
+    const divider = e.currentTarget;
+    const docOnRight = divider.dataset.side === "right";
+    try { divider.setPointerCapture(e.pointerId); } catch (_) {}
+    const move = (ev) => {
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      const docPct = docOnRight ? 100 - pct : pct;
+      setPrefs(p => ({ ...p, split: Math.min(75, Math.max(25, Math.round(docPct))) }));
+    };
+    const stop = () => {
+      divider.removeEventListener("pointermove", move);
+      divider.removeEventListener("pointerup", stop);
+      divider.removeEventListener("pointercancel", stop);
+    };
+    divider.addEventListener("pointermove", move);
+    divider.addEventListener("pointerup", stop);
+    divider.addEventListener("pointercancel", stop);
+  }, []);
 
   const send = useCallback(async (text) => {
     const content = (text ?? input).trim();
@@ -1941,10 +2484,18 @@ function ChatModal({ paper, onClose }) {
         .map(m => m.content)
         .join("\n");
       const evidence = selectEvidenceChunks(paperChunks, retrievalQuery);
+      // Snapshot of what the model was shown — verified by construction
+      // (literal source chunks, selected mechanically before the LLM ran).
+      const snapshot = evidence.slice(0, EVIDENCE_PER_MESSAGE).map(c => ({
+        id: c.evidenceId,
+        chunkId: c.chunkId,
+        section: c.label,
+        text: clipText(c.text, 300),
+      }));
       const evidenceBlock = formatEvidenceForPrompt(evidence);
       const systemPrompt = buildChatSystemPrompt(paper, evidenceBlock, !!fullText);
       const reply = await chatCall([{ role: "system", content: systemPrompt }, ...trimMessagesForModel(next)], 10000);
-      setMessages(m => [...m, { role: "assistant", content: reply.trim() || "(no response)" }]);
+      setMessages(m => [...m, { role: "assistant", content: reply.trim() || "(no response)", evidence: snapshot }]);
     } catch (e) {
       setMessages(m => [...m, { role: "assistant", content: "⚠️ " + (e.message || "Failed to get a response.") }]);
     } finally {
@@ -1958,86 +2509,201 @@ function ChatModal({ paper, onClose }) {
   }, [paper]);
 
   const showFollowups = messages.length > 0 && messages[messages.length - 1]?.role === "assistant";
+  const panesClass = `reader-panes${prefs.side === "right" ? " swap" : ""}${maximized ? ` max-${maximized}` : ""}`;
 
   return (
     <div
-      className="chat-overlay"
+      className="chat-overlay reader-overlay"
       role="dialog"
       aria-modal="true"
-      aria-label={`Chat about ${paper.title}`}
+      aria-label={`Read and chat: ${paper.title}`}
       onClick={onClose}
     >
-      <div className="chat-modal" onClick={e => e.stopPropagation()}>
-        <header className="chat-head">
+      <div className="chat-modal reader-shell" onClick={e => e.stopPropagation()}>
+        <header className="chat-head reader-head">
           <div className="chat-head-main">
-            <div className="chat-kicker">Chat with paper</div>
+            <div className="chat-kicker">Reader · chat with paper</div>
             <div className="chat-title">{paper.title}</div>
+            {byline && <div className="reader-byline">{byline}</div>}
             <div className="chat-status">
               {reading && <span className="mini-spin" aria-hidden="true" />}
-              <span>{chatStatus}</span>
+              <span>{collectNote || chatStatus}</span>
             </div>
           </div>
-          <div className="chat-head-actions">
+          <div className="chat-head-actions reader-actions">
+            {externalUrl && (
+              <a className="chat-clear reader-ext" href={externalUrl} target="_blank" rel="noreferrer">{externalLabel} ↗</a>
+            )}
+            <span className="collect-wrap">
+              <button type="button" className="chat-clear" aria-expanded={collectOpen} onClick={() => setCollectOpen(o => !o)}>
+                Collect
+              </button>
+              {collectOpen && (
+                <CollectionPicker
+                  papers={[paper]}
+                  onDone={(msg) => { setCollectNote(msg); setCollectOpen(false); }}
+                  onClose={() => setCollectOpen(false)}
+                />
+              )}
+            </span>
+            <button
+              type="button"
+              className="chat-clear"
+              title="Swap document and chat sides"
+              aria-label="Swap document and chat sides"
+              onClick={() => setPrefs(p => ({ ...p, side: p.side === "right" ? "left" : "right" }))}
+            >⇄</button>
             {messages.length > 0 && (
               <button type="button" className="chat-clear" onClick={clearChat}>Clear</button>
             )}
-            <button type="button" className="chat-close" aria-label="Close chat" onClick={onClose}>✕</button>
+            <button type="button" className="chat-close" aria-label="Close reader" onClick={onClose}>✕</button>
           </div>
         </header>
 
-        <div className="chat-body" ref={bodyRef}>
-          {reading && !allowSummaryOnly && (
-            <div className="chat-notice">
-              <span>For better accuracy, wait while the full paper is indexed.</span>
-              <button type="button" onClick={() => setAllowSummaryOnly(true)}>Ask using abstract now</button>
-            </div>
-          )}
-          {reading && allowSummaryOnly && (
-            <div className="chat-notice">Using abstract and generated briefing summary until full text finishes loading.</div>
-          )}
-          {!reading && !fullText && (
-            <div className="chat-notice warn">{fullTextError || "Full text is unavailable. Answers may be less complete."}</div>
-          )}
-          {messages.length === 0 && (
-            <div className="chat-intro">
-              <p className="chat-intro-lead">Ask anything about this paper. Try one of these:</p>
-              <div className="chat-suggest">
-                {CHAT_SUGGESTIONS.map(s => (
-                  <button key={s} type="button" disabled={!canAsk} onClick={() => send(s)}>{s}</button>
-                ))}
+        <div className={panesClass} ref={panesRef}>
+          <section className="reader-pane doc" style={{ flexBasis: `${prefs.split}%` }} aria-label="Paper document">
+            <div className="reader-pane-bar">
+              <div className="reader-tabs" role="tablist" aria-label="Document view">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={view === "text"}
+                  className={`reader-tab${view === "text" ? " on" : ""}`}
+                  onClick={() => setPrefs(p => ({ ...p, view: "text" }))}
+                >Text</button>
+                {arxivId && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === "pdf"}
+                    className={`reader-tab${view === "pdf" ? " on" : ""}`}
+                    onClick={() => setPrefs(p => ({ ...p, view: "pdf" }))}
+                  >PDF</button>
+                )}
               </div>
+              <button
+                type="button"
+                className="reader-max"
+                aria-pressed={maximized === "doc"}
+                title={maximized === "doc" ? "Restore split view" : "Maximize document"}
+                aria-label={maximized === "doc" ? "Restore split view" : "Maximize document pane"}
+                onClick={() => setMaximized(m => (m === "doc" ? null : "doc"))}
+              >{maximized === "doc" ? "🗗" : "🗖"}</button>
             </div>
-          )}
-          {messages.map((m, i) => (
-            <div key={i} className={`chat-msg ${m.role}`}>
-              <div className="chat-bubble"><MessageContent content={m.content} /></div>
+            <div className={`reader-doc-view${view === "text" ? " on" : ""}`}>
+              <ReaderTextView
+                chunks={paperChunks}
+                reading={reading}
+                fullText={fullText}
+                fullTextError={fullTextError}
+                flashChunk={flashChunk}
+                externalUrl={externalUrl}
+              />
             </div>
-          ))}
-          {sending && (
-            <div className="chat-msg assistant">
-              <div className="chat-bubble typing"><span /><span /><span /></div>
-            </div>
-          )}
-          {showFollowups && !sending && (
-            <div className="chat-followups">
-              {CHAT_FOLLOWUPS.map(s => (
-                <button key={s} type="button" disabled={!canAsk} onClick={() => send(s)}>{s}</button>
-              ))}
-            </div>
-          )}
-        </div>
+            {arxivId && pdfMounted && (
+              <div className={`reader-doc-view${view === "pdf" ? " on" : ""}`}>
+                <div className="reader-pdf-note">
+                  Some browsers block embedded PDFs — if the preview stays blank,{" "}
+                  <a href={`https://arxiv.org/pdf/${arxivId}`} target="_blank" rel="noreferrer">open the PDF in a new tab ↗</a>.
+                </div>
+                <iframe
+                  className="reader-pdf-frame"
+                  title={`PDF: ${paper.title}`}
+                  src={`https://arxiv.org/pdf/${arxivId}`}
+                  loading="lazy"
+                />
+              </div>
+            )}
+          </section>
 
-        <form className="chat-input-row" onSubmit={e => { e.preventDefault(); send(); }}>
-          <input
-            ref={inputRef}
-            className="chat-input"
-            placeholder={reading && !allowSummaryOnly ? "Reading full paper for better answers..." : "Ask about the method, results, limitations..."}
-            value={input}
-            disabled={!canAsk}
-            onChange={e => setInput(e.target.value)}
-          />
-          <button type="submit" className="chat-send" disabled={!canAsk || !input.trim()}>Send</button>
-        </form>
+          <div
+            className="reader-divider"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize document and chat panes"
+            data-side={prefs.side}
+            onPointerDown={onDividerDown}
+          ><span aria-hidden="true" /></div>
+
+          <section className="reader-pane chat" aria-label="Paper chat">
+            <div className="reader-pane-bar">
+              <span className="reader-pane-label">Chat</span>
+              <button
+                type="button"
+                className="reader-max"
+                aria-pressed={maximized === "chat"}
+                title={maximized === "chat" ? "Restore split view" : "Maximize chat"}
+                aria-label={maximized === "chat" ? "Restore split view" : "Maximize chat pane"}
+                onClick={() => setMaximized(m => (m === "chat" ? null : "chat"))}
+              >{maximized === "chat" ? "🗗" : "🗖"}</button>
+            </div>
+            <div className="chat-body" ref={bodyRef}>
+              {reading && !allowSummaryOnly && (
+                <div className="chat-notice">
+                  <span>For better accuracy, wait while the full paper is indexed.</span>
+                  <button type="button" onClick={() => setAllowSummaryOnly(true)}>Ask using abstract now</button>
+                </div>
+              )}
+              {reading && allowSummaryOnly && (
+                <div className="chat-notice">Using abstract and generated briefing summary until full text finishes loading.</div>
+              )}
+              {!reading && !fullText && (
+                <div className="chat-notice warn">{fullTextError || "Full text is unavailable. Answers may be less complete."}</div>
+              )}
+              {messages.length === 0 && (
+                <div className="chat-intro">
+                  <p className="chat-intro-lead">Ask anything about this paper. Try one of these:</p>
+                  <div className="chat-suggest">
+                    {CHAT_SUGGESTIONS.map(s => (
+                      <button key={s} type="button" disabled={!canAsk} onClick={() => send(s)}>{s}</button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {messages.map((m, i) => {
+                const citeMap = m.role === "assistant" && !m.content.startsWith("⚠️")
+                  ? new Map((m.evidence || []).map(e => [e.id, e]))
+                  : undefined;
+                return (
+                  <div key={i} className={`chat-msg ${m.role}`}>
+                    <div className="chat-msg-stack">
+                      <div className="chat-bubble">
+                        <MessageContent content={m.content} citeMap={citeMap} onCite={jumpToChunk} />
+                      </div>
+                      {m.role === "assistant" && m.evidence?.length > 0 && (
+                        <EvidenceRow evidence={m.evidence} onCite={jumpToChunk} />
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+              {sending && (
+                <div className="chat-msg assistant">
+                  <div className="chat-bubble typing"><span /><span /><span /></div>
+                </div>
+              )}
+              {showFollowups && !sending && (
+                <div className="chat-followups">
+                  {CHAT_FOLLOWUPS.map(s => (
+                    <button key={s} type="button" disabled={!canAsk} onClick={() => send(s)}>{s}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <form className="chat-input-row" onSubmit={e => { e.preventDefault(); send(); }}>
+              <input
+                ref={inputRef}
+                className="chat-input"
+                placeholder={reading && !allowSummaryOnly ? "Reading full paper for better answers..." : "Ask about the method, results, limitations..."}
+                value={input}
+                disabled={!canAsk}
+                onChange={e => setInput(e.target.value)}
+              />
+              <button type="submit" className="chat-send" disabled={!canAsk || !input.trim()}>Send</button>
+            </form>
+          </section>
+        </div>
       </div>
     </div>
   );
@@ -2233,7 +2899,9 @@ function PapersByYear({ papers }) {
   );
 }
 
-function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
+// `collection` is optional: opened from a Knowledge collection, the payload
+// also carries knowledge.collections and retrieval searches its indexed docs.
+function KnowledgeChat({ runs, runIds, sources = [], collection = null, onClose }) {
   const [messages, setMessages] = useState(() => readKnowledgeChat());
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -2262,7 +2930,11 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
       let retrieved = [];
       if (ragEnabled()) {
         setToolNote("Retrieving evidence...");
-        retrieved = await ragRetrieve(q, [...runIds, ...sources.map(s => s.id)]);
+        retrieved = await ragRetrieve(q, [
+          ...runIds,
+          ...sources.map(s => s.id),
+          ...(collection ? (collection.papers || []).map(p => collectionDocId(collection.id, p.key)) : []),
+        ]);
         setToolNote("");
       }
       await agentCall({
@@ -2275,6 +2947,18 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
             title: s.title,
             text: s.chunks ? undefined : clipText(s.excerpt || "", 1500),
           })),
+          ...(collection ? {
+            collections: [{
+              name: collection.name,
+              papers: (collection.papers || []).slice(0, 40).map(p => ({
+                title: p.title,
+                authors: p.authors,
+                date: p.date,
+                venue: p.venue || undefined,
+                abstract: clipText(p.abstract || "", 300),
+              })),
+            }],
+          } : {}),
         },
         onEvent: (evt) => {
           if (evt.type === "tool") {
@@ -2301,6 +2985,10 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
 
   const clearChat = () => { setMessages([]); saveKnowledgeChat([]); };
   const selectedTopics = runs.filter(r => runIds.includes(r.id)).map(r => r.topic).join(" · ");
+  const scopeTitle = collection ? `Collection: ${collection.name}` : (selectedTopics || "Saved research");
+  const scopeStatus = collection
+    ? `${(collection.papers || []).length} collected paper${(collection.papers || []).length === 1 ? "" : "s"}${runIds.length ? ` + ${runIds.length} run${runIds.length === 1 ? "" : "s"}` : ""} in context`
+    : `${runIds.length} research run${runIds.length === 1 ? "" : "s"} in context`;
 
   return (
     <div className="chat-overlay" role="dialog" aria-modal="true" aria-label="Chat with research knowledge" onClick={onClose}>
@@ -2308,10 +2996,10 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
         <header className="chat-head">
           <div className="chat-head-main">
             <div className="chat-kicker">Chat with knowledge</div>
-            <div className="chat-title">{selectedTopics || "Saved research"}</div>
+            <div className="chat-title">{scopeTitle}</div>
             <div className="chat-status">
               {(sending || toolNote) && <Dots />}
-              <span>{toolNote || (sending ? "Thinking..." : `${runIds.length} research run${runIds.length === 1 ? "" : "s"} in context`)}</span>
+              <span>{toolNote || (sending ? "Thinking..." : scopeStatus)}</span>
             </div>
           </div>
           <div className="chat-head-actions">
@@ -2325,7 +3013,11 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
         <div className="chat-body" ref={bodyRef}>
           {messages.length === 0 && (
             <div className="chat-intro">
-              <p className="chat-intro-lead">Ask across every paper in the selected research runs. The agent can also search arXiv and read papers when the knowledge base is not enough.</p>
+              <p className="chat-intro-lead">
+                {collection
+                  ? `Ask across the papers collected in “${collection.name}” (plus any selected runs). The agent can also search arXiv and read papers when the knowledge base is not enough.`
+                  : "Ask across every paper in the selected research runs. The agent can also search arXiv and read papers when the knowledge base is not enough."}
+              </p>
             </div>
           )}
           {messages.map((m, i) => (
@@ -2355,10 +3047,564 @@ function KnowledgeChat({ runs, runIds, sources = [], onClose }) {
   );
 }
 
-function ResearchPanel({ flash, onChatPaper, boot }) {
+// ── Discover: filtered multi-source paper search with research catalogs,
+//    saved searches, and collections. With a credential the server's
+//    discover action merges arXiv + Semantic Scholar + OpenAlex; guests
+//    fall back to a client-side arXiv-only query. ──
+
+const DISCOVER_DATE_CHIPS = [
+  { id: "any", label: "Any time", days: null },
+  { id: "1", label: "24h", days: 1 },
+  { id: "7", label: "7d", days: 7 },
+  { id: "30", label: "30d", days: 30 },
+  { id: "92", label: "3 months", days: 92 },
+  { id: "365", label: "Year", days: 365 },
+  { id: "custom", label: "Custom", days: null },
+];
+
+const DISCOVER_CATEGORIES = ["cs.CL", "cs.LG", "cs.CV", "cs.AI", "cs.RO", "stat.ML", "eess.IV"];
+
+// Curated research catalogs: one click fills query + filters and runs.
+const RESEARCH_CATALOGS = [
+  { name: "LLM Inference Optimization", query: "LLM inference optimization", filters: { category: "cs.LG", sort: "relevance" } },
+  { name: "Retrieval-Augmented Generation", query: "retrieval-augmented generation", filters: { category: "cs.CL", sort: "relevance" } },
+  { name: "Agentic AI", query: "LLM agents", filters: { category: "cs.AI", sort: "newest" } },
+  { name: "Multimodal AI", query: "multimodal language model", filters: { category: "cs.CV", sort: "relevance" } },
+  { name: "Model Compression", query: "model compression quantization", filters: { category: "cs.LG", sort: "relevance" } },
+  { name: "Efficient Transformers", query: "efficient transformer attention", filters: { category: "cs.LG", sort: "relevance" } },
+  { name: "Computer Vision", query: "computer vision", filters: { category: "cs.CV", sort: "newest" } },
+  { name: "Reinforcement Learning", query: "reinforcement learning", filters: { category: "cs.LG", sort: "relevance" } },
+  { name: "Robotics", query: "robot learning", filters: { category: "cs.RO", sort: "newest" } },
+];
+
+// Small dropdown: add papers to an existing collection or a new one inline.
+function CollectionPicker({ papers, up, onDone, onClose }) {
+  const [collections] = useState(() => readCollections());
+  const [newName, setNewName] = useState("");
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const onDocClick = (e) => { if (ref.current && !ref.current.contains(e.target)) onClose(); };
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", onDocClick);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  const add = (idOrName) => {
+    const { collection, added, full } = addPapersToCollection(idOrName, papers);
+    if (full) { onDone(`Collection limit reached (${COLLECTIONS_LIMIT} max)`); return; }
+    if (!collection) return;
+    onDone(added
+      ? `Added ${added} paper${added === 1 ? "" : "s"} to “${collection.name}”`
+      : `Nothing new to add to “${collection.name}”`);
+  };
+
+  return (
+    <div className={`collect-pop${up ? " up" : ""}`} ref={ref} role="menu" aria-label="Add to collection">
+      {collections.map(c => (
+        <button key={c.id} type="button" className="collect-opt" role="menuitem" onClick={() => add(c.id)}>
+          <span>{c.name}</span>
+          <span className="collect-count">{(c.papers || []).length}/{COLLECTION_PAPERS_LIMIT}</span>
+        </button>
+      ))}
+      {collections.length === 0 && <div className="collect-empty">No collections yet — name one below.</div>}
+      <form className="collect-new" onSubmit={e => { e.preventDefault(); if (newName.trim()) add(newName.trim()); }}>
+        <input
+          className="custom-in"
+          placeholder="New collection…"
+          value={newName}
+          onChange={e => setNewName(e.target.value)}
+        />
+        <button type="submit" className="ghost-btn" disabled={!newName.trim() || collections.length >= COLLECTIONS_LIMIT}>
+          Create
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function DiscoverCard({ paper, index, selected, onToggleSelect, saved, onToggleSave, onChat, onCollect, collectOpen, onPickerDone, onPickerClose }) {
+  const [expanded, setExpanded] = useState(false);
+  const arxivId = (String(paper.url || "").match(/(\d{4}\.\d{4,5})(v\d+)?/) || [])[1] || "";
+  const abstract = compactText(paper.abstract || "");
+  const sourceLabel = paper.source === "semanticscholar" ? "S2" : paper.source === "openalex" ? "OpenAlex" : "arXiv";
+
+  return (
+    <article className={`discover-card${selected ? " picked" : ""}`} style={{ animationDelay: `${(index % 8) * 45}ms` }}>
+      <input
+        type="checkbox"
+        className="discover-check"
+        checked={selected}
+        onChange={onToggleSelect}
+        aria-label={`Select ${paper.title}`}
+      />
+      <div className="discover-main">
+        <a className="discover-title" href={paper.url} target="_blank" rel="noreferrer">{paper.title}</a>
+        <div className="discover-meta">
+          {paper.authors}
+          {paper.date ? ` · ${String(paper.date).slice(0, 10)}` : ""}
+          {paper.venue ? ` · ${paper.venue}` : ""}
+        </div>
+        <div className="discover-badges">
+          <span className={`source-badge ${paper.source}`}>{sourceLabel}</span>
+          {paper.citations != null && <span className="cite-badge">{paper.citations} citations</span>}
+          {paper.pdfUrl
+            ? <a className="oa-badge" href={paper.pdfUrl} target="_blank" rel="noreferrer">OA · PDF ↗</a>
+            : paper.isOpenAccess ? <span className="oa-badge">Open access</span> : null}
+          {arxivId
+            ? <span className="discover-id">arXiv:{arxivId}</span>
+            : paper.doi ? <span className="discover-id">DOI {paper.doi}</span> : null}
+        </div>
+        {abstract && (
+          <p className="discover-abstract">
+            {expanded ? abstract : clipText(abstract, 230)}
+            {abstract.length > 240 && (
+              <button type="button" className="discover-more" onClick={() => setExpanded(x => !x)}>
+                {expanded ? "Show less" : "Show more"}
+              </button>
+            )}
+          </p>
+        )}
+      </div>
+      <div className="discover-actions">
+        <button type="button" className="ghost-btn" onClick={onChat}>Read & Chat</button>
+        <span className="collect-wrap">
+          <button type="button" className="ghost-btn" aria-expanded={collectOpen} onClick={onCollect}>Collect</button>
+          {collectOpen && <CollectionPicker papers={[paper]} onDone={onPickerDone} onClose={onPickerClose} />}
+        </span>
+        <button
+          type="button"
+          className={`save-btn ${saved ? "on" : ""}`}
+          title={saved ? "Remove bookmark" : "Bookmark"}
+          aria-label={saved ? `Remove bookmark for ${paper.title}` : `Bookmark ${paper.title}`}
+          onClick={onToggleSave}
+        >{saved ? "★" : "☆"}</button>
+        <a className="ghost-btn" href={paper.url} target="_blank" rel="noreferrer" aria-label={`Open ${paper.title} externally`}>↗</a>
+      </div>
+    </article>
+  );
+}
+
+function DiscoverPanel({ flash, boot, onChatPaper, isSaved, onToggleSave }) {
+  const [query, setQuery] = useState("");
+  const [dateMode, setDateMode] = useState("any");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [sort, setSort] = useState("relevance");
+  const [openAccess, setOpenAccess] = useState(false);
+  const [author, setAuthor] = useState("");
+  const [venue, setVenue] = useState("");
+  const [category, setCategory] = useState("");
+  const [catText, setCatText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [results, setResults] = useState(null); // {papers, counts, guest}
+  const [selection, setSelection] = useState(() => new Set());
+  const [pickerFor, setPickerFor] = useState(null); // "batch" | paper key | null
+  const [catalogs, setCatalogs] = useState(() => readCatalogs());
+  const [searches, setSearches] = useState(() => readSearches());
+  const abortRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const hasCredential = Boolean(browserApiKey || serverAccessToken);
+
+  const buildFilters = () => {
+    const f = {};
+    const chip = DISCOVER_DATE_CHIPS.find(c => c.id === dateMode);
+    if (dateMode === "custom") {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(customFrom)) f.from = customFrom;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(customTo)) f.to = customTo;
+    } else if (chip?.days) {
+      f.from = isoDaysAgo(chip.days);
+    }
+    if (sort !== "relevance") f.sort = sort;
+    if (openAccess) f.openAccess = true;
+    if (author.trim()) f.author = author.trim().slice(0, 120);
+    if (venue.trim()) f.venue = venue.trim().slice(0, 120);
+    const cat = (category === "custom" ? catText : category).trim();
+    if (cat) f.category = cat.slice(0, 40);
+    return f;
+  };
+
+  // Map a stored filter set back into the rail controls.
+  const applyFilterState = (f = {}) => {
+    if (f.from || f.to) {
+      setDateMode("custom");
+      setCustomFrom(f.from || "");
+      setCustomTo(f.to || "");
+    } else {
+      setDateMode("any");
+      setCustomFrom("");
+      setCustomTo("");
+    }
+    setSort(f.sort || "relevance");
+    setOpenAccess(!!f.openAccess);
+    setAuthor(f.author || "");
+    setVenue(f.venue || "");
+    if (f.category && DISCOVER_CATEGORIES.includes(f.category)) {
+      setCategory(f.category); setCatText("");
+    } else if (f.category) {
+      setCategory("custom"); setCatText(f.category);
+    } else {
+      setCategory(""); setCatText("");
+    }
+  };
+
+  const runSearch = async (overrideQuery, overrideFilters) => {
+    const q = (typeof overrideQuery === "string" ? overrideQuery : query).trim().slice(0, 300);
+    if (q.length < 2 || loading) return;
+    const filters = overrideFilters || buildFilters();
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setLoading(true); setError(""); setPickerFor(null);
+    try {
+      let next;
+      if (browserApiKey || serverAccessToken) {
+        const data = await discoverCall(q, filters, ac.signal);
+        next = {
+          papers: Array.isArray(data.papers) ? data.papers : [],
+          counts: data.counts || { arxiv: 0, semanticscholar: 0, openalex: 0 },
+          guest: false,
+        };
+      } else {
+        const raw = await fetchArxivOrNull(
+          buildGuestArxivQuery(q, filters),
+          25,
+          filters.sort === "newest" ? "submittedDate" : "relevance"
+        );
+        if (ac.signal.aborted) return;
+        // null = the fetch itself failed (direct + both CORS proxies), which
+        // is not "zero matches" — surface it as an error, not an empty list.
+        if (raw === null) {
+          throw new Error("Could not reach arXiv (network or proxy failure) — try again, or add an API key in Settings to search server-side.");
+        }
+        const papers = sortDiscoverClient(dedupe(raw), filters.sort);
+        next = { papers, counts: { arxiv: papers.length, semanticscholar: 0, openalex: 0 }, guest: true };
+      }
+      setResults(next);
+      setSelection(new Set());
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Search failed.");
+    } finally {
+      if (abortRef.current === ac) abortRef.current = null;
+      if (!ac.signal.aborted) setLoading(false);
+    }
+  };
+
+  // Prefill + run from the launchpad / command palette.
+  useEffect(() => {
+    if (boot?.query) {
+      const q = boot.query.slice(0, 300);
+      setQuery(q);
+      runSearch(q);
+    }
+  }, [boot?.ts]);
+
+  const applyCatalog = (cat) => {
+    setQuery(cat.query);
+    applyFilterState(cat.filters);
+    runSearch(cat.query, cat.filters || {});
+  };
+
+  const saveAsCatalog = () => {
+    const q = query.trim();
+    if (q.length < 2) return;
+    const name = q.slice(0, 60);
+    setCatalogs(saveCatalogs([{ name, query: q, filters: buildFilters() }, ...catalogs.filter(c => c.name !== name)]));
+    flash(`Catalog “${name}” saved`);
+  };
+
+  const removeCatalog = (name) => {
+    setCatalogs(saveCatalogs(catalogs.filter(c => c.name !== name)));
+    flash("Catalog deleted");
+  };
+
+  const saveCurrentSearch = () => {
+    const q = query.trim();
+    if (q.length < 2) return;
+    const entry = {
+      id: newId("search"),
+      name: q.slice(0, 80),
+      query: q,
+      filters: buildFilters(),
+      createdAt: new Date().toISOString(),
+      lastRunAt: null,
+    };
+    setSearches(saveSearches([entry, ...searches]));
+    flash("Search saved");
+  };
+
+  const runSaved = (s) => {
+    setQuery(s.query);
+    applyFilterState(s.filters);
+    setSearches(saveSearches(searches.map(x => x.id === s.id ? { ...x, lastRunAt: new Date().toISOString() } : x)));
+    runSearch(s.query, s.filters || {});
+  };
+
+  const removeSearch = (id) => {
+    setSearches(saveSearches(searches.filter(s => s.id !== id)));
+    flash("Saved search deleted");
+  };
+
+  const toggleSelect = (p) => {
+    const k = agentPaperKey(p);
+    setSelection(prev => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k); else next.add(k);
+      return next;
+    });
+  };
+
+  const selectedPapers = (results?.papers || []).filter(p => selection.has(agentPaperKey(p)));
+
+  const onPickerDone = (msg, fromBatch) => {
+    flash(msg);
+    setPickerFor(null);
+    if (fromBatch) setSelection(new Set());
+  };
+
+  return (
+    <>
+      <section className={`topic-panel discover-panel${loading ? " running" : ""}`} aria-label="Discover papers">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Discover</span>
+            <p className="section-copy">Filtered literature search across arXiv, Semantic Scholar, and OpenAlex — merged, deduplicated by id → DOI → title, and ready to collect.</p>
+          </div>
+          <div className="knowledge-actions">
+            <button type="button" className="ghost-btn" onClick={saveAsCatalog} disabled={query.trim().length < 2} title="Keep this query + filters as a reusable catalog chip">
+              Save as catalog
+            </button>
+            <button type="button" className="ghost-btn" onClick={saveCurrentSearch} disabled={query.trim().length < 2} title="Keep this query + filters in the saved-searches list">
+              Save search
+            </button>
+          </div>
+        </div>
+
+        <div className="controls discover-controls">
+          <label className="fld compact">
+            <span className="ctl-label">Search query</span>
+            <input
+              className="custom-in"
+              placeholder="e.g. KV cache compression, speculative decoding..."
+              value={query}
+              disabled={loading}
+              onChange={e => setQuery(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !loading && runSearch()}
+            />
+          </label>
+          <button type="button" className="run-btn primary-action" onClick={() => runSearch()} disabled={loading || query.trim().length < 2}>
+            {loading ? "Searching..." : "Search"}
+          </button>
+        </div>
+
+        <div className="discover-rail">
+          <div className="discover-rail-group">
+            <span className="ctl-label">Published</span>
+            <div className="discover-chips">
+              {DISCOVER_DATE_CHIPS.map(c => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`chip${dateMode === c.id ? " on" : ""}`}
+                  aria-pressed={dateMode === c.id}
+                  disabled={loading}
+                  onClick={() => setDateMode(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            {dateMode === "custom" && (
+              <div className="discover-dates">
+                <input type="date" aria-label="From date" value={customFrom} disabled={loading} onChange={e => setCustomFrom(e.target.value)} />
+                <span aria-hidden="true">→</span>
+                <input type="date" aria-label="To date" value={customTo} disabled={loading} onChange={e => setCustomTo(e.target.value)} />
+              </div>
+            )}
+          </div>
+          <label className="fld">
+            <span className="ctl-label">Sort</span>
+            <select value={sort} disabled={loading} onChange={e => setSort(e.target.value)}>
+              <option value="relevance">Relevance</option>
+              <option value="newest">Newest</option>
+              {/* arXiv data has no citation counts; as a guest this sort would silently do nothing */}
+              <option value="citations" disabled={!hasCredential}>
+                {hasCredential ? "Most cited" : "Most cited (needs a key)"}
+              </option>
+            </select>
+          </label>
+          <label className="fld">
+            <span className="ctl-label">Author</span>
+            <input placeholder="e.g. Sutton" value={author} disabled={loading} onChange={e => setAuthor(e.target.value)} />
+          </label>
+          <label className="fld" title={hasCredential ? undefined : "Venue data comes from Semantic Scholar + OpenAlex — add a credential in Settings"}>
+            <span className="ctl-label">{hasCredential ? "Venue" : "Venue (needs a key)"}</span>
+            <input placeholder="e.g. NeurIPS" value={venue} disabled={loading || !hasCredential} onChange={e => setVenue(e.target.value)} />
+          </label>
+          <label className="fld">
+            <span className="ctl-label">arXiv category</span>
+            <select value={category} disabled={loading} onChange={e => setCategory(e.target.value)}>
+              <option value="">Any category</option>
+              {DISCOVER_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              <option value="custom">Other…</option>
+            </select>
+          </label>
+          {category === "custom" && (
+            <label className="fld">
+              <span className="ctl-label">Category code</span>
+              <input placeholder="e.g. q-bio.NC" value={catText} disabled={loading} onChange={e => setCatText(e.target.value)} />
+            </label>
+          )}
+          <label className="toggle" title={hasCredential ? "Only papers the sources mark as open access" : "Every arXiv paper is open access — this filter needs Semantic Scholar + OpenAlex (add a credential in Settings)"}>
+            <input type="checkbox" checked={openAccess} disabled={loading || !hasCredential} onChange={e => setOpenAccess(e.target.checked)} />
+            <span>Open access</span>
+          </label>
+        </div>
+
+        <div className="discover-catalogs">
+          <span className="ctl-label">Research catalogs</span>
+          <div className="discover-chips">
+            {RESEARCH_CATALOGS.map(c => (
+              <button key={c.name} type="button" className="chip" disabled={loading} title={`Search: ${c.query}`} onClick={() => applyCatalog(c)}>
+                {c.name}
+              </button>
+            ))}
+            {catalogs.map(c => (
+              <span key={c.name} className="chip user-catalog">
+                <button type="button" className="catalog-run" disabled={loading} title={`Search: ${c.query}`} onClick={() => applyCatalog(c)}>
+                  {c.name}
+                </button>
+                <button type="button" className="catalog-x" aria-label={`Delete catalog ${c.name}`} onClick={() => removeCatalog(c.name)}>×</button>
+              </span>
+            ))}
+          </div>
+        </div>
+
+        {!hasCredential && (
+          <div className="guest-note">Guest mode: arXiv only — venue, citation sort, and open-access filters need Semantic Scholar + OpenAlex (add a key in Settings).</div>
+        )}
+
+        {error && (
+          <div className="error-box" role="alert">
+            <div>{error}</div>
+            <button type="button" className="run-btn" onClick={() => runSearch()}>Try again</button>
+          </div>
+        )}
+      </section>
+
+      {loading && (
+        <section className="progress-wrap" aria-label="Search progress">
+          <div className="spin-row">
+            <div className="mini-spin" aria-hidden="true" />
+            <span className="spin-text">
+              {hasCredential ? "Searching arXiv + Semantic Scholar + OpenAlex…" : "Searching arXiv…"}
+            </span>
+          </div>
+        </section>
+      )}
+
+      {results && !loading && (
+        <section className="results" aria-label="Discover results">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Results ({results.papers.length})</span>
+              <p className="section-copy counts-line">
+                {results.guest
+                  ? `arXiv ${results.counts.arxiv} — guest mode, Semantic Scholar and OpenAlex not queried`
+                  : `arXiv ${results.counts.arxiv} · Semantic Scholar ${results.counts.semanticscholar} · OpenAlex ${results.counts.openalex} → ${results.papers.length} merged`}
+              </p>
+            </div>
+          </div>
+          {results.papers.length === 0 && (
+            <div className="empty">No papers matched. Loosen the filters or broaden the query.</div>
+          )}
+          <div className="knowledge-list">
+            {results.papers.map((p, i) => {
+              const k = agentPaperKey(p);
+              return (
+                <DiscoverCard
+                  key={k + i}
+                  paper={p}
+                  index={i}
+                  selected={selection.has(k)}
+                  onToggleSelect={() => toggleSelect(p)}
+                  saved={isSaved(p)}
+                  onToggleSave={() => {
+                    const was = isSaved(p);
+                    onToggleSave(p);
+                    flash(was ? "Bookmark removed" : "Bookmarked");
+                  }}
+                  onChat={() => onChatPaper(p)}
+                  collectOpen={pickerFor === k}
+                  onCollect={() => setPickerFor(cur => (cur === k ? null : k))}
+                  onPickerDone={(msg) => onPickerDone(msg, false)}
+                  onPickerClose={() => setPickerFor(null)}
+                />
+              );
+            })}
+          </div>
+          {selection.size > 0 && (
+            <div className="batch-bar" role="toolbar" aria-label="Selected papers actions">
+              <span className="batch-count">{selection.size} selected</span>
+              <span className="collect-wrap">
+                <button type="button" className="run-btn primary-action" onClick={() => setPickerFor(cur => (cur === "batch" ? null : "batch"))}>
+                  Add {selection.size} to collection
+                </button>
+                {pickerFor === "batch" && (
+                  <CollectionPicker papers={selectedPapers} up onDone={(msg) => onPickerDone(msg, true)} onClose={() => setPickerFor(null)} />
+                )}
+              </span>
+              <button type="button" className="ghost-btn" onClick={() => setSelection(new Set())}>Clear</button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {searches.length > 0 && (
+        <section className="results" aria-label="Saved searches">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Saved searches</span>
+              <p className="section-copy">Kept in this browser (last {SEARCHES_LIMIT}).</p>
+            </div>
+          </div>
+          <div className="knowledge-list">
+            {searches.map((s, i) => (
+              <div key={s.id} className="knowledge-row" style={{ animationDelay: `${(i % 6) * 50}ms` }}>
+                <span className="knowledge-topic">{s.name}</span>
+                <span className="knowledge-meta">
+                  {describeDiscoverFilters(s.filters)} · saved {(s.createdAt || "").slice(0, 10)}
+                  {s.lastRunAt ? ` · last run ${s.lastRunAt.slice(0, 10)}` : ""}
+                </span>
+                <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" disabled={loading} onClick={() => runSaved(s)}>Run</button>
+                  <button type="button" className="ghost-btn" onClick={() => removeSearch(s.id)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {!results && !loading && searches.length === 0 && (
+        <section className="empty hero-empty">
+          <strong>Find papers across three literature sources.</strong>
+          <span>Type a query, pick a catalog, or tune the filters — results merge arXiv, Semantic Scholar, and OpenAlex, then land in bookmarks, chat, or your collections.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
+function ResearchPanel({ flash, onChatPaper, boot, onNavigate }) {
   const [topic, setTopic] = useState("");
-  // Prefill from the launchpad / command palette.
-  useEffect(() => { if (boot?.query) setTopic(boot.query.slice(0, 300)); }, [boot?.ts]);
   const [deep, setDeep] = useState(false);
   const [running, setRunning] = useState(false);
   const [steps, setSteps] = useState([]);           // [{phase, label, done}]
@@ -2367,25 +3613,40 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
   const [papers, setPapers] = useState([]);
   const [draft, setDraft] = useState({});   // partial results streamed before completion
   const [run, setRun] = useState(null);
-  const [savedRuns, setSavedRuns] = useState(() => readKnowledge().runs);
-  const [selectedRunIds, setSelectedRunIds] = useState(() => readKnowledge().runs.slice(0, 1).map(r => r.id));
-  const [chatOpen, setChatOpen] = useState(false);
+  // Saved runs, the library, and knowledge chat live in the Knowledge mode
+  // now; Research only remembers whether anything is saved (for the pointer
+  // and the empty state) without re-reading pb_knowledge every render.
+  const [savedRunCount, setSavedRunCount] = useState(() => readKnowledge().runs.length);
+  const [savedToKnowledge, setSavedToKnowledge] = useState(false);
   const [error, setError] = useState("");
-  const [sources, setSources] = useState(() => readKnowledgeSources());
-  const [sourceInput, setSourceInput] = useState("");
-  const [noteMode, setNoteMode] = useState(false);
-  const [noteTitle, setNoteTitle] = useState("");
-  const [noteText, setNoteText] = useState("");
-  const [ingesting, setIngesting] = useState(false);
   const abortRef = useRef(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Prefill from the launchpad / command palette — or reopen a saved run for
+  // viewing (palette "Open run", Knowledge "View", the universe's run hubs):
+  // the run renders through the same sections a live run fills.
+  useEffect(() => {
+    if (boot?.runId) {
+      const saved = readKnowledge().runs.find(r => r.id === boot.runId);
+      if (saved && !running) {
+        setTopic(saved.topic || "");
+        setRun(saved);
+        setPapers(saved.papers || []);
+        setSteps([]); setLogs([]); setDraft({}); setError("");
+        setIdeaProgress(null);
+        setSavedToKnowledge(false);
+      }
+    } else if (boot?.query) {
+      setTopic(boot.query.slice(0, 300));
+    }
+  }, [boot?.ts]);
 
   const start = async (overrideTopic) => {
     const t = (typeof overrideTopic === "string" ? overrideTopic : topic).trim().slice(0, 300);
     if (t.length < 3 || running) return;
     if (typeof overrideTopic === "string") setTopic(t);
-    setRunning(true); setError(""); setSteps([]); setLogs([]); setPapers([]); setDraft({}); setRun(null); setIdeaProgress(null);
+    setRunning(true); setError(""); setSteps([]); setLogs([]); setPapers([]); setDraft({}); setRun(null); setIdeaProgress(null); setSavedToKnowledge(false);
     const ac = new AbortController();
     abortRef.current = ac;
     try {
@@ -2408,9 +3669,8 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
           } else if (evt.type === "result" && evt.run) {
             setRun(evt.run);
             setSteps(prev => prev.map(s => ({ ...s, done: true })));
-            const runs = saveKnowledgeRun(evt.run);
-            setSavedRuns(runs);
-            setSelectedRunIds([evt.run.id]);
+            setSavedRunCount(saveKnowledgeRun(evt.run).length);
+            setSavedToKnowledge(true);
             flash("Research run saved to knowledge");
             indexRun(evt.run); // fire-and-forget; toasts its own progress
           }
@@ -2435,62 +3695,10 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
       const all = readKnowledge();
       const runs = all.runs.map(r => (r.id === theRun.id ? { ...r, ragChunks: n } : r));
       setJSON(LS.knowledge, { ...all, runs });
-      setSavedRuns(runs);
       flash(`Indexed ${n} chunks for retrieval`);
     } catch (err) {
       flash(`Indexing failed: ${err.message || "error"}`);
     }
-  };
-
-  // ── library sources: arXiv ids, URLs, pasted notes ──
-  const finishAddSource = async (title, text, origin) => {
-    const id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `src-${Date.now()}`;
-    let chunks = 0;
-    if (ragEnabled()) chunks = await ragIndexDocument({ docId: id, title, text });
-    const meta = {
-      id, title: title.slice(0, 200), origin, chars: text.length, chunks, ts: Date.now(),
-      // keep a lexical excerpt so the source stays searchable with RAG off
-      excerpt: clipText(text, 6000),
-    };
-    const next = saveKnowledgeSources([meta, ...sources]);
-    setSources(next);
-    flash(chunks ? `Added "${meta.title}" — ${chunks} chunks indexed` : `Added "${meta.title}"`);
-  };
-
-  const addSource = async () => {
-    const url = sourceInput.trim();
-    if (!url || ingesting) return;
-    setIngesting(true);
-    try {
-      const data = await ingestCall(url);
-      await finishAddSource(data.title || url, data.text, data.origin || "url");
-      setSourceInput("");
-    } catch (err) {
-      flash(err.message || "Could not add that source");
-    } finally {
-      setIngesting(false);
-    }
-  };
-
-  const addNote = async () => {
-    const text = noteText.trim();
-    if (text.length < 50 || ingesting) return;
-    setIngesting(true);
-    try {
-      await finishAddSource(noteTitle.trim() || `Note ${new Date().toISOString().slice(0, 10)}`, text, "note");
-      setNoteTitle(""); setNoteText(""); setNoteMode(false);
-    } catch (err) {
-      flash(err.message || "Could not add the note");
-    } finally {
-      setIngesting(false);
-    }
-  };
-
-  const removeSource = async (id) => {
-    try { await ragDeleteDoc(id); } catch (_) {}
-    const next = saveKnowledgeSources(sources.filter(s => s.id !== id));
-    setSources(next);
-    flash("Source removed");
   };
 
   // A failed/stopped run keeps whatever the stream delivered; save it as a
@@ -2510,9 +3718,8 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
       report: draft.report || "",
       finishedAt: new Date().toISOString(),
     };
-    const runs = saveKnowledgeRun(partialRun);
-    setSavedRuns(runs);
-    setSelectedRunIds([partialRun.id]);
+    setSavedRunCount(saveKnowledgeRun(partialRun).length);
+    setSavedToKnowledge(true);
     setRun(partialRun);
     setError("");
     flash("Partial research saved to knowledge");
@@ -2532,26 +3739,6 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
     } else {
       navigator.clipboard?.writeText(md).then(() => flash("Briefing copied as Markdown"), () => flash("Copy failed"));
     }
-  };
-
-  const removeRun = (id) => {
-    ragDeleteDoc(id).catch(() => {});
-    const runs = deleteKnowledgeRun(id);
-    setSavedRuns(runs);
-    setSelectedRunIds(ids => ids.filter(x => x !== id));
-    if (run?.id === id) setRun(null);
-    flash("Research run deleted");
-  };
-
-  const toggleRunSelected = (id) => {
-    setSelectedRunIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
-  };
-
-  const loadRun = (r) => {
-    setRun(r);
-    setPapers((r.papers || []).map(p => ({ id: agentPaperKey(p), ...p })));
-    setTopic(r.topic || "");
-    setSteps([]); setLogs([]); setIdeaProgress(null); setError("");
   };
 
   const shownPapers = run?.papers?.length ? run.papers : papers;
@@ -2840,6 +4027,638 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
         </section>
       )}
 
+      {savedToKnowledge && run && (
+        <section className="results knowledge-pointer" aria-label="Saved to knowledge base">
+          <span>Saved to the knowledge base — manage runs, the library, and collections in Knowledge.</span>
+          <button type="button" className="ghost-btn" onClick={() => onNavigate("knowledge")}>Open Knowledge →</button>
+        </section>
+      )}
+
+      {savedRunCount === 0 && !running && shownPapers.length === 0 && (
+        <section className="empty hero-empty">
+          <strong>No research yet.</strong>
+          <span>Type a topic and run the agent. Each run is saved as reusable knowledge you can chat with in the Knowledge mode.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
+// ── Knowledge mode: curated paper collections (manage / analyze / chat /
+//    index), plus the library and the saved-runs knowledge base that moved
+//    here from the Research panel. All storage stays under pb_knowledge. ──
+
+function KnowledgePanel({ flash, boot, onChatPaper, onNavigate }) {
+  // collections manager
+  const [collections, setCollections] = useState(() => readCollections());
+  const [activeId, setActiveId] = useState(() => readCollections()[0]?.id || "");
+  const [newName, setNewName] = useState("");
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameText, setRenameText] = useState("");
+  // collection analysis stream (ResearchPanel.start idiom)
+  const [analyzing, setAnalyzing] = useState(false);
+  const [steps, setSteps] = useState([]);           // [{phase, label, done}]
+  const [logs, setLogs] = useState([]);
+  const [draft, setDraft] = useState({});           // partials streamed before completion
+  const [error, setError] = useState("");
+  // browser RAG index build over the collection
+  const [indexing, setIndexing] = useState(false);
+  const [indexNote, setIndexNote] = useState("");
+  // library sources (moved from ResearchPanel)
+  const [sources, setSources] = useState(() => readKnowledgeSources());
+  const [sourceInput, setSourceInput] = useState("");
+  const [noteMode, setNoteMode] = useState(false);
+  const [noteTitle, setNoteTitle] = useState("");
+  const [noteText, setNoteText] = useState("");
+  const [ingesting, setIngesting] = useState(false);
+  // saved research runs (moved from ResearchPanel)
+  const [savedRuns, setSavedRuns] = useState(() => readKnowledge().runs);
+  const [selectedRunIds, setSelectedRunIds] = useState(() => readKnowledge().runs.slice(0, 1).map(r => r.id));
+  const [chatScope, setChatScope] = useState(null); // "runs" | "collection" | null
+  const abortRef = useRef(null);
+  const indexCancelRef = useRef(false);
+
+  useEffect(() => () => {
+    abortRef.current?.abort();
+    indexCancelRef.current = true;
+  }, []);
+
+  // Preselect a collection opened from the command palette / universe.
+  useEffect(() => {
+    if (boot?.collectionId) {
+      setCollections(readCollections());
+      setActiveId(boot.collectionId);
+    }
+  }, [boot?.ts]);
+
+  const active = collections.find(c => c.id === activeId) || null;
+  const colPapers = active?.papers || [];
+  const colIndexByKey = collectionPaperIndex(colPapers);
+  const colByIndex = colPapers;
+
+  // During (or after a failed) analysis the streamed draft shows; otherwise
+  // the stored analysis. The result handler clears the draft, so a finished
+  // run falls through to what was persisted.
+  const hasDraft = Object.keys(draft).length > 0;
+  const a = active?.analysis || null;
+  const view = analyzing || hasDraft
+    ? { themes: draft.themes || [], concepts: draft.concepts || [], comparison: draft.comparison || [], brief: draft.brief || "" }
+    : a
+      ? { themes: a.themes || [], concepts: a.concepts || [], comparison: a.comparison || [], brief: a.brief || "" }
+      : null;
+  const briefForDisplay = (view?.brief || "").replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
+
+  const pushLog = (msg) => setLogs(prev => [...prev.slice(-4), msg]);
+
+  // ── collections manager ──
+  const create = () => {
+    const { collections: next, collection, full } = createCollection(newName);
+    if (full) { flash(`Collection limit reached (${COLLECTIONS_LIMIT} max)`); return; }
+    if (!collection) return;
+    setCollections(next);
+    setActiveId(collection.id);
+    setNewName("");
+    flash(`Collection “${collection.name}” created`);
+  };
+
+  const startRename = (c) => { setRenamingId(c.id); setRenameText(c.name); };
+
+  const finishRename = () => {
+    const clean = renameText.trim().slice(0, 80);
+    if (renamingId && clean) {
+      setCollections(updateCollection(renamingId, c => ({ ...c, name: clean })));
+      flash("Collection renamed");
+    }
+    setRenamingId(null);
+    setRenameText("");
+  };
+
+  const remove = (c) => {
+    if (!window.confirm(`Delete collection “${c.name}” (${(c.papers || []).length} papers)? This cannot be undone.`)) return;
+    for (const p of c.papers || []) ragDeleteDoc(collectionDocId(c.id, p.key)).catch(() => {});
+    const next = deleteCollection(c.id);
+    setCollections(next);
+    if (activeId === c.id) setActiveId(next[0]?.id || "");
+    flash("Collection deleted");
+  };
+
+  const removePaper = (key) => {
+    if (!active) return;
+    ragDeleteDoc(collectionDocId(active.id, key)).catch(() => {});
+    setCollections(updateCollection(active.id, c => ({ ...c, papers: (c.papers || []).filter(p => p.key !== key) })));
+    flash("Paper removed from the collection");
+  };
+
+  // ── analyze: stream the 'collection' action (themes → compare → brief) ──
+  const analyze = async () => {
+    const col = active;
+    if (!col || analyzing) return;
+    if ((col.papers || []).length < 2) { flash("Analysis needs at least 2 papers — collect more in Discover"); return; }
+    const papersPayload = (col.papers || []).slice(0, COLLECTION_ANALYZE_LIMIT).map(p => ({
+      title: p.title,
+      url: p.url || undefined,
+      abstract: p.abstract || undefined,
+      authors: p.authors || undefined,
+      date: p.date || undefined,
+      venue: p.venue || undefined,
+      citations: Number.isInteger(p.citations) ? p.citations : undefined,
+      doi: p.doi || undefined,
+    }));
+    setAnalyzing(true); setError(""); setSteps([]); setLogs([]); setDraft({});
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      await agentCall({
+        action: "collection",
+        name: col.name,
+        papers: papersPayload,
+        signal: ac.signal,
+        onEvent: (evt) => {
+          if (evt.type === "phase") {
+            setSteps(prev => [...prev.map(s => ({ ...s, done: true })), { phase: evt.phase, label: evt.label, done: false }]);
+          } else if (evt.type === "log") {
+            pushLog(evt.message);
+          } else if (evt.type === "partial") {
+            setDraft(d => ({ ...d, [evt.key]: evt.value }));
+          } else if (evt.type === "result" && evt.analysis) {
+            setSteps(prev => prev.map(s => ({ ...s, done: true })));
+            setCollections(saveCollectionAnalysis(col.id, evt.analysis));
+            setDraft({});
+            flash("Collection analyzed and saved");
+          }
+        },
+      });
+    } catch (err) {
+      if (!ac.signal.aborted) setError(err.message || "Collection analysis failed.");
+    } finally {
+      setAnalyzing(false);
+      abortRef.current = null;
+    }
+  };
+
+  const stopAnalyze = () => { abortRef.current?.abort(); };
+
+  // A failed/stopped analysis keeps whatever streamed; save it as a (marked)
+  // partial analysis so nothing is lost (ResearchPanel.savePartial pattern).
+  const savePartialAnalysis = () => {
+    if (!active) return;
+    setCollections(saveCollectionAnalysis(active.id, {
+      id: newId("colrun"),
+      name: active.name,
+      partial: true,
+      themes: draft.themes || [],
+      concepts: draft.concepts || [],
+      comparison: draft.comparison || [],
+      brief: draft.brief || "",
+      finishedAt: new Date().toISOString(),
+    }));
+    setDraft({});
+    setError("");
+    flash("Partial analysis saved");
+  };
+
+  // ── build index: full text per paper into the browser vector store ──
+  const buildIndex = async () => {
+    const col = active;
+    if (!col || indexing) return;
+    if (!ragEnabled()) { flash("Semantic search is off — choose an embeddings platform in Settings first"); return; }
+    const pending = (col.papers || []).filter(p => !p.ragChunks);
+    if (!pending.length) { flash("Every paper in this collection is already indexed"); return; }
+    setIndexing(true);
+    indexCancelRef.current = false;
+    let ok = 0;
+    let failed = 0;
+    for (let i = 0; i < pending.length; i++) {
+      if (indexCancelRef.current) break;
+      const p = pending[i];
+      setIndexNote(`Indexing ${i + 1}/${pending.length}`);
+      try {
+        // Credentialed: server ingest first (SSRF-guarded); then the
+        // CORS-proxy full-text path; last resort is title + abstract. A
+        // url-less paper skips ingest — a title is not a fetchable URL.
+        let text = "";
+        if ((browserApiKey || serverAccessToken) && p.url) {
+          try {
+            const data = await ingestCall(p.url);
+            if (typeof data?.text === "string" && data.text.trim().length > 500) text = data.text.slice(0, FULLTEXT_LIMIT);
+          } catch (_) { /* best-effort; the proxy path follows */ }
+        }
+        if (!text) text = await fetchPaperText(p).catch(() => "");
+        if (!text) {
+          text = [p.title, p.abstract].filter(Boolean).join("\n\n");
+          pushLog(`Full text unavailable for “${clipText(p.title, 60)}” — indexed the abstract only.`);
+        }
+        const n = await ragIndexDocument({ docId: collectionDocId(col.id, p.key), title: p.title, text });
+        if (indexCancelRef.current) break;
+        if (n > 0) {
+          ok++;
+          setCollections(updateCollection(col.id, c => ({
+            ...c,
+            papers: (c.papers || []).map(x => (x.key === p.key ? { ...x, ragChunks: n } : x)),
+          })));
+        } else {
+          failed++;
+          pushLog(`No indexable text for “${clipText(p.title, 60)}”; skipped.`);
+        }
+      } catch (err) {
+        failed++;
+        pushLog(`Indexing failed for “${clipText(p.title, 60)}”: ${err.message || "error"}`);
+      }
+    }
+    setIndexing(false);
+    setIndexNote("");
+    flash(failed
+      ? `Indexed ${ok}/${pending.length} papers — ${failed} failed (see the log)`
+      : `Indexed ${ok} paper${ok === 1 ? "" : "s"} for retrieval`);
+  };
+
+  // ── exports ──
+  const exportCollection = (download) => {
+    if (!active) return;
+    const md = buildCollectionMarkdown(active);
+    if (download) {
+      const blob = new Blob([md], { type: "text/markdown" });
+      const el = document.createElement("a");
+      el.href = URL.createObjectURL(blob);
+      el.download = `paperpulse-collection-${new Date().toISOString().slice(0, 10)}.md`;
+      el.click(); URL.revokeObjectURL(el.href);
+      flash("Collection downloaded");
+    } else {
+      navigator.clipboard?.writeText(md).then(() => flash("Collection copied as Markdown"), () => flash("Copy failed"));
+    }
+  };
+
+  const exportComparisonCsv = () => {
+    if (!active?.analysis?.comparison?.length) return;
+    const blob = new Blob([buildComparisonCsv(active)], { type: "text/csv" });
+    const el = document.createElement("a");
+    el.href = URL.createObjectURL(blob);
+    el.download = `paperpulse-comparison-${new Date().toISOString().slice(0, 10)}.csv`;
+    el.click(); URL.revokeObjectURL(el.href);
+    flash("Comparison downloaded as CSV");
+  };
+
+  // ── library sources: arXiv ids, URLs, pasted notes (moved from Research) ──
+  const finishAddSource = async (title, text, origin) => {
+    const id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `src-${Date.now()}`;
+    let chunks = 0;
+    if (ragEnabled()) chunks = await ragIndexDocument({ docId: id, title, text });
+    const meta = {
+      id, title: title.slice(0, 200), origin, chars: text.length, chunks, ts: Date.now(),
+      // keep a lexical excerpt so the source stays searchable with RAG off
+      excerpt: clipText(text, 6000),
+    };
+    const next = saveKnowledgeSources([meta, ...sources]);
+    setSources(next);
+    flash(chunks ? `Added "${meta.title}" — ${chunks} chunks indexed` : `Added "${meta.title}"`);
+  };
+
+  const addSource = async () => {
+    const url = sourceInput.trim();
+    if (!url || ingesting) return;
+    setIngesting(true);
+    try {
+      const data = await ingestCall(url);
+      await finishAddSource(data.title || url, data.text, data.origin || "url");
+      setSourceInput("");
+    } catch (err) {
+      flash(err.message || "Could not add that source");
+    } finally {
+      setIngesting(false);
+    }
+  };
+
+  const addNote = async () => {
+    const text = noteText.trim();
+    if (text.length < 50 || ingesting) return;
+    setIngesting(true);
+    try {
+      await finishAddSource(noteTitle.trim() || `Note ${new Date().toISOString().slice(0, 10)}`, text, "note");
+      setNoteTitle(""); setNoteText(""); setNoteMode(false);
+    } catch (err) {
+      flash(err.message || "Could not add the note");
+    } finally {
+      setIngesting(false);
+    }
+  };
+
+  const removeSource = async (id) => {
+    try { await ragDeleteDoc(id); } catch (_) {}
+    const next = saveKnowledgeSources(sources.filter(s => s.id !== id));
+    setSources(next);
+    flash("Source removed");
+  };
+
+  // ── saved research runs (moved from Research) ──
+  const indexRun = async (theRun) => {
+    if (!ragEnabled()) return;
+    try {
+      flash("Indexing for semantic search...");
+      const n = await ragIndexDocument({ docId: theRun.id, title: theRun.topic, text: runToRagText(theRun) });
+      const all = readKnowledge();
+      const runs = all.runs.map(r => (r.id === theRun.id ? { ...r, ragChunks: n } : r));
+      setJSON(LS.knowledge, { ...all, runs });
+      setSavedRuns(runs);
+      flash(`Indexed ${n} chunks for retrieval`);
+    } catch (err) {
+      flash(`Indexing failed: ${err.message || "error"}`);
+    }
+  };
+
+  const removeRun = (id) => {
+    ragDeleteDoc(id).catch(() => {});
+    const runs = deleteKnowledgeRun(id);
+    setSavedRuns(runs);
+    setSelectedRunIds(ids => ids.filter(x => x !== id));
+    flash("Research run deleted");
+  };
+
+  const toggleRunSelected = (id) => {
+    setSelectedRunIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
+  };
+
+  const exportRunMd = (r) => {
+    const blob = new Blob([buildResearchMarkdown(r)], { type: "text/markdown" });
+    const el = document.createElement("a");
+    el.href = URL.createObjectURL(blob);
+    el.download = `paperpulse-research-${new Date().toISOString().slice(0, 10)}.md`;
+    el.click(); URL.revokeObjectURL(el.href);
+    flash("Briefing downloaded");
+  };
+
+  const sourceLabel = (s) => s === "semanticscholar" ? "S2" : s === "openalex" ? "OpenAlex" : s === "hf" ? "HF" : "arXiv";
+  const hasAnything = collections.length > 0 || sources.length > 0 || savedRuns.length > 0;
+
+  return (
+    <>
+      <section className={`topic-panel knowledge-panel${analyzing ? " running" : ""}`} aria-label="Knowledge collections">
+        <div className="section-head">
+          <div>
+            <span className="section-label">Knowledge</span>
+            <p className="section-copy">Curated paper collections plus everything your agents saved. Pick a collection to analyze it, chat across it, or index it for semantic retrieval.</p>
+          </div>
+          <span className="hint">{collections.length}/{COLLECTIONS_LIMIT} collections</span>
+        </div>
+        <form className="collection-new" onSubmit={e => { e.preventDefault(); create(); }}>
+          <input
+            className="custom-in"
+            placeholder="New collection name…"
+            value={newName}
+            onChange={e => setNewName(e.target.value)}
+          />
+          <button type="submit" className="run-btn primary-action" disabled={!newName.trim() || collections.length >= COLLECTIONS_LIMIT}>
+            Create
+          </button>
+        </form>
+        {collections.length > 0 ? (
+          <div className="collection-grid">
+            {collections.map((c, i) => (
+              <div key={c.id} className={`collection-card${c.id === activeId ? " on" : ""}`} style={{ animationDelay: `${(i % 6) * 55}ms` }}>
+                {renamingId === c.id ? (
+                  <form className="collection-rename" onSubmit={e => { e.preventDefault(); finishRename(); }}>
+                    <input
+                      className="custom-in"
+                      value={renameText}
+                      autoFocus
+                      onChange={e => setRenameText(e.target.value)}
+                      onKeyDown={e => { if (e.key === "Escape") { setRenamingId(null); setRenameText(""); } }}
+                    />
+                    <button type="submit" className="ghost-btn" disabled={!renameText.trim()}>Save</button>
+                  </form>
+                ) : (
+                  <button type="button" className="collection-pick" onClick={() => setActiveId(c.id)}>
+                    <span className="collection-name">{c.name}</span>
+                    <span className="collection-meta">{(c.papers || []).length}/{COLLECTION_PAPERS_LIMIT} papers</span>
+                  </button>
+                )}
+                {c.analysis && <span className="analyzed-badge">{c.analysis.partial ? "partial" : "analyzed"}</span>}
+                <div className="collection-tools">
+                  <button type="button" className="ghost-btn" onClick={() => startRename(c)}>Rename</button>
+                  <button type="button" className="ghost-btn" onClick={() => remove(c)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="guest-note">No collections yet — name one above, or collect papers from Discover and the reader's Collect button.</div>
+        )}
+      </section>
+
+      {active && (
+        <section className="results" aria-label={`Collection: ${active.name}`}>
+          <div className="section-head">
+            <div>
+              <span className="section-label">{active.name} ({colPapers.length})</span>
+              <p className="section-copy">Analyze maps themes and concepts, compares the papers side by side, and writes a cited brief — first {COLLECTION_ANALYZE_LIMIT} papers per analysis.</p>
+            </div>
+            <div className="knowledge-actions">
+              {analyzing ? (
+                <button type="button" className="run-btn" onClick={stopAnalyze}>Stop</button>
+              ) : (
+                <button type="button" className="run-btn primary-action" onClick={analyze} disabled={colPapers.length < 2}>
+                  {active.analysis ? "Re-analyze" : "Analyze"}
+                </button>
+              )}
+              <button type="button" className="run-btn" onClick={() => setChatScope("collection")} disabled={colPapers.length === 0}>
+                Chat with collection
+              </button>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={buildIndex}
+                disabled={indexing || !ragEnabled() || colPapers.length === 0}
+                title={ragEnabled()
+                  ? "Fetch each paper's full text and index it for semantic retrieval"
+                  : "Semantic search is off — choose an embeddings platform in Settings"}
+              >
+                {indexing ? (indexNote || "Indexing...") : "Build index"}
+              </button>
+              <button type="button" className="ghost-btn" onClick={() => exportCollection(false)}>Copy MD</button>
+              <button type="button" className="ghost-btn" onClick={() => exportCollection(true)}>Export MD</button>
+              {active.analysis?.comparison?.length > 0 && (
+                <button type="button" className="ghost-btn" onClick={exportComparisonCsv}>Export CSV</button>
+              )}
+            </div>
+          </div>
+
+          {!ragEnabled() && colPapers.length > 0 && (
+            <div className="guest-note">Semantic search is off — lexical search only. Pick an embeddings platform in Settings to build this collection's retrieval index.</div>
+          )}
+
+          {(steps.length > 0 || analyzing) && (
+            <div className="agent-steps" aria-label="Analysis progress">
+              {steps.map((s, i) => (
+                <div key={`${s.phase}-${i}`} className={`agent-step ${s.done ? "done" : "on"}`}>
+                  {!s.done && <Dots />}
+                  <span className="agent-step-label">{s.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {logs.map((msg, i) => <div key={`log-${i}`} className="agent-log">{msg}</div>)}
+
+          {error && (
+            <div className="error-box" role="alert">
+              <div>{error}</div>
+              {hasDraft && (
+                <button type="button" className="run-btn" onClick={savePartialAnalysis}>
+                  Save partial analysis
+                </button>
+              )}
+              {hasDraft && <span className="hint">The sections streamed before the failure are kept below.</span>}
+            </div>
+          )}
+
+          {colPapers.length === 0 ? (
+            <div className="empty collection-empty">
+              <strong>This collection is empty.</strong>
+              <span>Find papers in Discover and use Collect — per card, or with the multi-select batch bar.</span>
+              <button type="button" className="run-btn primary-action" onClick={() => onNavigate("discover")}>Find papers →</button>
+            </div>
+          ) : (
+            <div className="knowledge-list">
+              {colPapers.map((p, i) => (
+                <div key={p.key} className="knowledge-row collection-paper" style={{ animationDelay: `${(i % 8) * 45}ms` }}>
+                  <span className="paper-chip">[{i + 1}]</span>
+                  <span className="lab-source-main">
+                    {p.url
+                      ? <a href={p.url} target="_blank" rel="noreferrer">{p.title}</a>
+                      : <span className="knowledge-topic">{p.title}</span>}
+                    <span className="knowledge-meta">
+                      {[p.venue, (p.date || "").slice(0, 4)].filter(Boolean).join(" · ") || "—"}
+                      {p.citations != null ? ` · ${p.citations} citations` : ""}
+                      {p.ragChunks ? ` · ${p.ragChunks} chunks indexed` : ""}
+                    </span>
+                  </span>
+                  {p.source && <span className={`source-badge ${p.source}`}>{sourceLabel(p.source)}</span>}
+                  <div className="knowledge-actions">
+                    <button type="button" className="ghost-btn" onClick={() => onChatPaper(p)}>Read & Chat</button>
+                    <button type="button" className="ghost-btn" onClick={() => removePaper(p.key)}>Remove</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {view?.themes?.length > 0 && (
+        <section className="results" aria-label="Collection themes">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Cross-paper themes</span>
+              <p className="section-copy">What binds this collection: where the papers agree and where they diverge.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {view.themes.map((t, i) => (
+              <div key={i} className="theme-card" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">{t.name}</div>
+                <p className="theme-summary">{t.summary}</p>
+                {t.agreements?.length > 0 && (
+                  <div className="theme-list"><strong>Agree</strong>{t.agreements.map((x, j) => <span key={j}>{x}</span>)}</div>
+                )}
+                {t.contradictions?.length > 0 && (
+                  <div className="theme-list warn"><strong>Diverge</strong>{t.contradictions.map((x, j) => <span key={j}>{x}</span>)}</div>
+                )}
+                <div className="theme-papers">
+                  {(t.paperIds || []).map(id => colIndexByKey.get(id)
+                    ? <span key={id} className="paper-chip" title={colByIndex[colIndexByKey.get(id) - 1]?.title}>[{colIndexByKey.get(id)}]</span>
+                    : null)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {active && (view?.themes?.length > 0 || view?.concepts?.length > 0) && (
+        <section className="results" aria-label="Collection graph">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Graph</span>
+              <p className="section-copy">The collection as a graph: which papers each theme and concept draws on. Hover to trace connections; click a paper to chat with it.</p>
+            </div>
+          </div>
+          <KnowledgeGraph run={{ papers: colPapers, themes: view.themes, concepts: view.concepts }} onChatPaper={onChatPaper} />
+          <PapersByYear papers={colPapers} />
+        </section>
+      )}
+
+      {view?.concepts?.length > 0 && (
+        <section className="results" aria-label="Collection concepts">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Understand</span>
+              <p className="section-copy">The concepts a reader needs to follow this collection, explained plainly.</p>
+            </div>
+          </div>
+          <div className="theme-grid">
+            {view.concepts.map((c, i) => (
+              <div key={i} className="theme-card" style={{ animationDelay: `${(i % 6) * 60}ms` }}>
+                <div className="theme-name">{c.name}</div>
+                <p className="theme-summary">{c.explanation}</p>
+                <div className="theme-papers">
+                  {(c.paperIds || []).map(id => colIndexByKey.get(id)
+                    ? <span key={id} className="paper-chip" title={colByIndex[colIndexByKey.get(id) - 1]?.title}>[{colIndexByKey.get(id)}]</span>
+                    : null)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {view?.comparison?.length > 0 && (
+        <section className="results" aria-label="Collection comparison">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Compare</span>
+              <p className="section-copy">The collected papers side by side: approach, contribution, evidence, and sharpest limitation.</p>
+            </div>
+          </div>
+          <div className="compare-scroll">
+            <table className="compare-table">
+              <thead>
+                <tr><th>Paper</th><th>Approach</th><th>Contribution</th><th>Evidence</th><th>Limitation</th></tr>
+              </thead>
+              <tbody>
+                {view.comparison.map((r, i) => {
+                  const n = colIndexByKey.get(r.paperId);
+                  const p = n != null ? colByIndex[n - 1] : null;
+                  return (
+                    <tr key={i}>
+                      <td className="compare-paper">
+                        <span className="paper-chip" title={p?.title}>[{n || "?"}]</span>
+                        {p && (p.url
+                          ? <a href={p.url} target="_blank" rel="noreferrer">{p.title}</a>
+                          : <span>{p.title}</span>)}
+                      </td>
+                      <td>{r.approach}</td>
+                      <td>{r.contribution}</td>
+                      <td>{r.evidence}</td>
+                      <td>{r.limitation}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {view?.brief && (
+        <section className="results" aria-label="Collection brief">
+          <div className="section-head">
+            <div>
+              <span className="section-label">Brief</span>
+              <p className="section-copy">An executive read of “{active?.name}”. Citations [n] point into the paper list above.</p>
+            </div>
+          </div>
+          <div className="agent-report"><MessageContent content={briefForDisplay} /></div>
+        </section>
+      )}
+
       <section className="results" aria-label="Library">
         <div className="section-head">
           <div>
@@ -2914,7 +4733,7 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
               type="button"
               className="run-btn"
               disabled={selectedRunIds.length === 0 && sources.length === 0}
-              onClick={() => setChatOpen(true)}
+              onClick={() => setChatScope("runs")}
             >
               Chat with knowledge
             </button>
@@ -2935,10 +4754,11 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
                   {r.ragChunks ? ` · ${r.ragChunks} chunks indexed` : ""}
                 </span>
                 <div className="knowledge-actions">
+                  <button type="button" className="ghost-btn" title="Reopen this run's report, themes, and graph in Research" onClick={() => onNavigate("research", "", "", r.id)}>View</button>
                   {ragEnabled() && !r.ragChunks && (
                     <button type="button" className="ghost-btn" onClick={() => indexRun(r)}>Index</button>
                   )}
-                  <button type="button" className="ghost-btn" onClick={() => loadRun(r)}>Load</button>
+                  <button type="button" className="ghost-btn" onClick={() => exportRunMd(r)}>Export MD</button>
                   <button type="button" className="ghost-btn" onClick={() => removeRun(r.id)}>Delete</button>
                 </div>
               </div>
@@ -2947,15 +4767,21 @@ function ResearchPanel({ flash, onChatPaper, boot }) {
         </section>
       )}
 
-      {savedRuns.length === 0 && !running && shownPapers.length === 0 && (
+      {!hasAnything && (
         <section className="empty hero-empty">
-          <strong>No research yet.</strong>
-          <span>Type a topic and run the agent. Each run is saved as reusable knowledge you can chat with.</span>
+          <strong>Nothing in the knowledge base yet.</strong>
+          <span>Collect papers from Discover into a collection, run the Research agent, or add library sources — everything lands here, ready to analyze and chat with.</span>
         </section>
       )}
 
-      {chatOpen && (
-        <KnowledgeChat runs={savedRuns} runIds={selectedRunIds} sources={sources} onClose={() => setChatOpen(false)} />
+      {chatScope && (
+        <KnowledgeChat
+          runs={savedRuns}
+          runIds={selectedRunIds}
+          sources={sources}
+          collection={chatScope === "collection" ? active : null}
+          onClose={() => setChatScope(null)}
+        />
       )}
     </>
   );
@@ -4043,7 +5869,7 @@ function buildUniverseData() {
 
   for (const run of (k.runs || []).slice(0, 5)) {
     const c = cluster++;
-    const hub = add({ id: `run:${run.id}`, kind: "hub", mode: "research", label: run.topic, cluster: c, size: 11, meta: `research run · ${(run.papers || []).length} papers · ${(run.finishedAt || "").slice(0, 10)}` });
+    const hub = add({ id: `run:${run.id}`, kind: "hub", mode: "research", runId: run.id, label: run.topic, cluster: c, size: 11, meta: `research run · ${(run.papers || []).length} papers · ${(run.finishedAt || "").slice(0, 10)}` });
     const paperIds = new Map();
     for (const p of (run.papers || []).slice(0, 10)) {
       const id = add({ id: `p:${run.id}:${agentPaperKey(p)}`, kind: "paper", label: p.title, cluster: c, size: 5.5, meta: `${p.authors} · ${p.date || "n.d."}`, url: p.url });
@@ -4071,6 +5897,15 @@ function buildUniverseData() {
     for (const h of lab.hypotheses || []) {
       const v = lab.debate?.verdicts?.find(x => x.hypothesisId === h.id);
       const id = add({ id: `h:${lab.id}:${h.id}`, kind: "hypothesis", label: `${h.id}: ${h.statement}`, cluster: c, size: 7.5, meta: `hypothesis · ${v ? `${v.verdict} (${v.confidence})` : "undebated"}` });
+      edges.push([hub, id]);
+    }
+  }
+
+  for (const col of (k.collections || []).slice(0, 4)) {
+    const c = cluster++;
+    const hub = add({ id: `col:${col.id}`, kind: "hub", mode: "knowledge", collectionId: col.id, label: col.name, cluster: c, size: 10, meta: `collection · ${(col.papers || []).length} papers${col.analysis ? " · analyzed" : ""}` });
+    for (const p of (col.papers || []).slice(0, 10)) {
+      const id = add({ id: `cp:${col.id}:${p.key}`, kind: "collection", label: p.title, cluster: c, size: 5.5, meta: `${p.authors || "—"} · ${(p.date || "n.d.").slice(0, 10)}`, url: p.url });
       edges.push([hub, id]);
     }
   }
@@ -4111,6 +5946,7 @@ const UNIVERSE_KINDS = [
   { kind: "theme", label: "Themes", cssVar: "--viz-theme" },
   { kind: "concept", label: "Concepts", cssVar: "--viz-concept" },
   { kind: "hypothesis", label: "Hypotheses", cssVar: "--accent-2" },
+  { kind: "collection", label: "Collections", cssVar: "--viz-collection" },
   { kind: "article", label: "Articles", cssVar: "--accent" },
 ];
 
@@ -4342,8 +6178,8 @@ function ResearchUniverse({ theme, onOpenMode }) {
               <a className="ghost-btn" href={selected.url} target="_blank" rel="noreferrer">Open paper ↗</a>
             )}
             {selected.mode && (
-              <button type="button" className="ghost-btn" onClick={() => onOpenMode(selected.mode)}>
-                Explore in {selected.mode === "lab" ? "Lab" : selected.mode === "studio" ? "Studio" : "Research"} →
+              <button type="button" className="ghost-btn" onClick={() => onOpenMode(selected.mode, selected.collectionId, selected.runId)}>
+                Explore in {selected.mode === "lab" ? "Lab" : selected.mode === "studio" ? "Studio" : selected.mode === "knowledge" ? "Knowledge" : "Research"} →
               </button>
             )}
           </div>
@@ -4381,12 +6217,14 @@ function HomePanel({ flash, theme, onNavigate }) {
     const k = readKnowledge();
     const runs = k.runs || [];
     const labs = k.labs || [];
+    const collections = k.collections || [];
     const articles = readArticles();
     const paperKeys = new Set();
-    for (const r of [...runs, ...labs]) for (const p of r.papers || []) paperKeys.add(agentPaperKey(p));
+    for (const r of [...runs, ...labs, ...collections]) for (const p of r.papers || []) paperKeys.add(agentPaperKey(p));
     return {
       runs: runs.length,
       labs: labs.length,
+      collections: collections.length,
       papers: paperKeys.size,
       hypotheses: labs.reduce((n, l) => n + (l.hypotheses || []).length, 0),
       verified: labs.reduce((n, l) => n + (l.findings || []).flatMap(f => f.claims || []).filter(c => c.verified).length, 0),
@@ -4397,7 +6235,7 @@ function HomePanel({ flash, theme, onNavigate }) {
   const activity = useMemo(() => {
     const k = readKnowledge();
     const items = [
-      ...(k.runs || []).map(r => ({ kind: "research", mode: "research", title: r.topic, at: r.finishedAt, meta: `${(r.papers || []).length} papers · ${(r.themes || []).length} themes${r.partial ? " · partial" : ""}` })),
+      ...(k.runs || []).map(r => ({ kind: "research", mode: "research", runId: r.id, title: r.topic, at: r.finishedAt, meta: `${(r.papers || []).length} papers · ${(r.themes || []).length} themes${r.partial ? " · partial" : ""}` })),
       ...(k.labs || []).map(l => ({ kind: "investigation", mode: "lab", title: l.objective, at: l.finishedAt, meta: `${(l.hypotheses || []).length} hypotheses · ${(l.protocols || []).length} protocols` })),
       ...readArticles().map(a => ({ kind: "article", mode: "studio", title: a.title, at: a.finishedAt, meta: `${(a.sections || []).length} sections` })),
     ];
@@ -4405,15 +6243,21 @@ function HomePanel({ flash, theme, onNavigate }) {
   }, []);
 
   const launch = (mode) => {
-    onNavigate(mode, launchText.trim());
-    if (launchText.trim()) flash(`${mode === "lab" ? "Objective" : mode === "studio" ? "Goal" : "Topic"} prefilled — review and launch`);
+    // Knowledge has no text prefill — its boot field is a collection id.
+    onNavigate(mode, mode === "knowledge" ? "" : launchText.trim());
+    if (launchText.trim() && mode !== "knowledge") {
+      flash(mode === "discover"
+        ? "Searching the literature..."
+        : `${mode === "lab" ? "Objective" : mode === "studio" ? "Goal" : "Topic"} prefilled — review and launch`);
+    }
   };
 
-  const hasData = stats.runs + stats.labs + stats.articles > 0;
+  const hasData = stats.runs + stats.labs + stats.collections + stats.articles > 0;
 
   const TILES = [
-    ["Research runs", stats.runs], ["Investigations", stats.labs], ["Papers indexed", stats.papers],
-    ["Hypotheses", stats.hypotheses], ["Verified quotes", stats.verified], ["Articles", stats.articles],
+    ["Research runs", stats.runs], ["Investigations", stats.labs], ["Collections", stats.collections],
+    ["Papers indexed", stats.papers], ["Hypotheses", stats.hypotheses], ["Verified quotes", stats.verified],
+    ["Articles", stats.articles],
   ];
 
   return (
@@ -4439,6 +6283,8 @@ function HomePanel({ flash, theme, onNavigate }) {
               Investigate (Lab)
             </button>
             <button type="button" className="run-btn" onClick={() => launch("research")}>Research run</button>
+            <button type="button" className="run-btn" onClick={() => launch("discover")}>Discover papers</button>
+            <button type="button" className="run-btn" onClick={() => launch("knowledge")}>Curate knowledge</button>
             <button type="button" className="run-btn" onClick={() => launch("studio")}>Write an article</button>
           </div>
         </div>
@@ -4460,7 +6306,7 @@ function HomePanel({ flash, theme, onNavigate }) {
               <p className="section-copy">Your knowledge base as a 3D space — each constellation is a run or investigation; papers, themes, concepts, hypotheses, and articles orbit it.</p>
             </div>
           </div>
-          <ResearchUniverse theme={theme} onOpenMode={(m) => onNavigate(m, "")} />
+          <ResearchUniverse theme={theme} onOpenMode={(m, collectionId, runId) => onNavigate(m, "", collectionId || "", runId || "")} />
         </section>
       )}
 
@@ -4479,7 +6325,7 @@ function HomePanel({ flash, theme, onNavigate }) {
                 <span className="knowledge-topic">{a.title}</span>
                 <span className="knowledge-meta">{a.meta} · {(a.at || "").slice(0, 10)}</span>
                 <div className="knowledge-actions">
-                  <button type="button" className="ghost-btn" onClick={() => onNavigate(a.mode, "")}>Open →</button>
+                  <button type="button" className="ghost-btn" onClick={() => onNavigate(a.mode, "", "", a.runId || "")}>Open →</button>
                 </div>
               </div>
             ))}
@@ -4512,16 +6358,19 @@ function CommandPalette({ open, onClose, run }) {
     if (!open) return [];
     const base = [
       { label: "Go to Command center", hint: "navigate", act: { nav: "home" } },
+      { label: "Go to Discover", hint: "navigate", act: { nav: "discover" } },
       { label: "Go to Digest", hint: "navigate", act: { nav: "digest" } },
       { label: "Go to Research", hint: "navigate", act: { nav: "research" } },
       { label: "Go to Lab", hint: "navigate", act: { nav: "lab" } },
+      { label: "Go to Knowledge", hint: "navigate", act: { nav: "knowledge" } },
       { label: "Go to Studio", hint: "navigate", act: { nav: "studio" } },
       { label: "Toggle theme", hint: "appearance", act: { theme: true } },
       { label: "Open settings", hint: "configure", act: { settings: true } },
     ];
     const k = readKnowledge();
-    for (const r of (k.runs || []).slice(0, 6)) base.push({ label: `Open run: ${r.topic}`, hint: "research", act: { nav: "research" } });
+    for (const r of (k.runs || []).slice(0, 6)) base.push({ label: `Open run: ${r.topic}`, hint: "research", act: { nav: "research", runId: r.id } });
     for (const l of (k.labs || []).slice(0, 6)) base.push({ label: `Open investigation: ${l.objective}`, hint: "lab", act: { nav: "lab" } });
+    for (const c of (k.collections || []).slice(0, 6)) base.push({ label: `Open collection: ${c.name}`, hint: "knowledge", act: { nav: "knowledge", collectionId: c.id } });
     for (const a of readArticles().slice(0, 6)) base.push({ label: `Open article: ${a.title}`, hint: "studio", act: { nav: "studio" } });
     return base;
   }, [open]);
@@ -4531,6 +6380,7 @@ function CommandPalette({ open, onClose, run }) {
   const launchers = q.length >= 3 ? [
     { label: `Investigate: “${query.trim()}”`, hint: "lab agents", act: { nav: "lab", query: query.trim() } },
     { label: `Research run: “${query.trim()}”`, hint: "research agent", act: { nav: "research", query: query.trim() } },
+    { label: `Discover papers: “${query.trim()}”`, hint: "multi-source search", act: { nav: "discover", query: query.trim() } },
   ] : [];
   const items = [...launchers, ...filtered].slice(0, 12);
   const active = Math.min(cursor, Math.max(items.length - 1, 0));
@@ -4791,8 +6641,8 @@ export default function App() {
   const [embKeyInput, setEmbKeyInput] = useState("");
   const [toast, setToast] = useState("");
   const [chatPaper, setChatPaper] = useState(null);
-  const [mode, setMode] = useState("home"); // home | digest | research | lab | studio
-  const [boot, setBoot] = useState(null);   // {query, ts} — prefill for the next panel
+  const [mode, setMode] = useState("home"); // home | discover | digest | research | lab | knowledge | studio
+  const [boot, setBoot] = useState(null);   // {query, collectionId, runId, ts} — prefill for the next panel
   const [paletteOpen, setPaletteOpen] = useState(false);
   // The auth gate shows once per tab session; credentials themselves stay in
   // tab memory only, so a hard reload signs the user out by design.
@@ -4812,8 +6662,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const navigateTo = useCallback((m, query = "") => {
-    if (query) setBoot({ query, ts: Date.now() });
+  const navigateTo = useCallback((m, query = "", collectionId = "", runId = "") => {
+    if (query || collectionId || runId) setBoot({ query, collectionId, runId, ts: Date.now() });
     setMode(m);
     setPaletteOpen(false);
   }, []);
@@ -4837,6 +6687,16 @@ export default function App() {
   useEffect(() => { setJSON(LS.bookmarks, bookmarks); }, [bookmarks]);
 
   const flash = useCallback((msg) => { setToast(msg); setTimeout(() => setToast(""), 1800); }, []);
+
+  // Surface localStorage quota failures (setJSON returns false but callers
+  // flash success synchronously right after a save — the deferred warning
+  // replaces that toast so "saved" never stands when nothing persisted).
+  useEffect(() => {
+    onStorageWriteError = () => {
+      setTimeout(() => flash("Browser storage is full — the last change was NOT saved. Delete old runs, labs, or collections to free space."), 60);
+    };
+    return () => { onStorageWriteError = null; };
+  }, [flash]);
 
   const enterWorkspace = useCallback((credential) => {
     if (credential?.kind === "key") {
@@ -5088,8 +6948,10 @@ export default function App() {
               >
                 ⌘K
               </button>
-              <div className="mode-switch" role="tablist" aria-label="Workspace mode">
-                {[["home", "Home"], ["digest", "Digest"], ["research", "Research"], ["lab", "Lab"], ["studio", "Studio"]].map(([m, label]) => (
+              {/* layoutScroll: the strip scrolls on narrow screens, so motion
+                  must account for its scroll offset when moving the pill. */}
+              <motion.div layoutScroll className="mode-switch" role="tablist" aria-label="Workspace mode">
+                {[["home", "Home"], ["discover", "Discover"], ["digest", "Digest"], ["research", "Research"], ["lab", "Lab"], ["knowledge", "Knowledge"], ["studio", "Studio"]].map(([m, label]) => (
                   <button
                     key={m}
                     type="button"
@@ -5097,6 +6959,11 @@ export default function App() {
                     aria-selected={mode === m}
                     className={`mode-tab${mode === m ? " on" : ""}`}
                     onClick={() => setMode(m)}
+                    onFocus={e => {
+                      // Keyboard focus on a tab scrolled out of the strip pulls it back in.
+                      const reduced = typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+                      e.currentTarget.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "nearest", inline: "nearest" });
+                    }}
                   >
                     {mode === m && (
                       <motion.span
@@ -5108,7 +6975,7 @@ export default function App() {
                     <span className="mode-tab-label">{label}</span>
                   </button>
                 ))}
-              </div>
+              </motion.div>
               <button
                 type="button"
                 className="icon-btn"
@@ -5182,9 +7049,15 @@ export default function App() {
 
         {mode === "home" && <HomePanel flash={flash} theme={theme} onNavigate={navigateTo} />}
 
-        {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} boot={boot} />}
+        {mode === "discover" && (
+          <DiscoverPanel flash={flash} boot={boot} onChatPaper={setChatPaper} isSaved={isSaved} onToggleSave={toggleSave} />
+        )}
+
+        {mode === "research" && <ResearchPanel flash={flash} onChatPaper={setChatPaper} boot={boot} onNavigate={navigateTo} />}
 
         {mode === "lab" && <LabPanel flash={flash} boot={boot} />}
+
+        {mode === "knowledge" && <KnowledgePanel flash={flash} boot={boot} onChatPaper={setChatPaper} onNavigate={navigateTo} />}
 
         {mode === "studio" && <StudioPanel flash={flash} boot={boot} />}
 
@@ -5363,7 +7236,7 @@ export default function App() {
           run={(act) => {
             if (act.theme) { setTheme(t => (t === "dark" ? "light" : "dark")); setPaletteOpen(false); return; }
             if (act.settings) { setShowSettings(true); setPaletteOpen(false); return; }
-            if (act.nav) navigateTo(act.nav, act.query || "");
+            if (act.nav) navigateTo(act.nav, act.query || "", act.collectionId || "", act.runId || "");
           }}
         />
       )}
@@ -6697,11 +8570,14 @@ input:disabled, select:disabled {
   --shadow:0 1px 2px rgba(30,27,75,.05), 0 16px 44px rgba(30,27,75,.10);
   --accent-grad:linear-gradient(135deg, #7c3aed 0%, #5b4ae8 100%);
   --bg:#f9f6ff;
-  /* categorical viz hues (paper/theme/concept) — validated for CVD + contrast
-     against the light surface; dark mode gets its own validated steps. */
+  /* categorical viz hues (paper/theme/concept/collection) — validated for CVD
+     + contrast against the light surface; dark mode gets its own validated
+     steps. Collection's rose sits between the cyan and purple legend
+     neighbors (deutan ΔE ≥ 10 on both adjacent pairs). */
   --viz-paper:#7c3aed;
   --viz-theme:#d97706;
   --viz-concept:#0d9488;
+  --viz-collection:#db2777;
   accent-color:var(--accent);
   background:
     radial-gradient(1100px 520px at 88% -12%, rgba(124,58,237,.10), transparent 60%),
@@ -6727,6 +8603,7 @@ input:disabled, select:disabled {
   --viz-paper:#8b5cf6;
   --viz-theme:#c47207;
   --viz-concept:#0e9888;
+  --viz-collection:#ec4899;
   background:
     radial-gradient(1100px 520px at 88% -12%, rgba(139,92,246,.17), transparent 60%),
     radial-gradient(900px 460px at -8% -4%, rgba(34,211,238,.08), transparent 55%),
@@ -7583,6 +9460,552 @@ button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 @media (max-width:520px) {
   .auth-methods { grid-template-columns:1fr; }
   .auth-card { padding:22px 18px; }
+}
+
+/* ── Discover mode ──
+   Appended after the AI-native reskin so these rules inherit its tokens;
+   colors come only from the custom properties, so both themes just work.
+   Motion is keyframes-only and collapses under the reduced-motion override
+   at the bottom of this sheet. */
+.discover-controls { grid-template-columns:minmax(240px, 1fr) auto; }
+.discover-panel.running::after {
+  content:"";
+  display:block;
+  height:3px;
+  margin-top:14px;
+  border-radius:999px;
+  background:linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size:200% 100%;
+  animation:sweep 1.1s linear infinite;
+}
+.discover-rail {
+  display:flex;
+  flex-wrap:wrap;
+  gap:14px;
+  align-items:flex-end;
+  margin-top:16px;
+  padding-top:14px;
+  border-top:1px dashed var(--line);
+}
+.discover-rail .fld { flex:1 1 140px; max-width:220px; }
+.discover-rail .toggle { flex:none; }
+.discover-rail-group { flex:2 1 320px; display:flex; flex-direction:column; gap:7px; }
+.discover-chips { display:flex; flex-wrap:wrap; gap:8px; }
+.discover-chips .chip { padding:6px 11px; font-size:12.5px; }
+.discover-dates { display:flex; align-items:center; gap:8px; color:var(--muted); }
+.discover-dates input { max-width:170px; }
+.discover-catalogs { margin-top:16px; display:flex; flex-direction:column; gap:7px; }
+.chip.user-catalog { display:inline-flex; align-items:stretch; gap:0; padding:0; overflow:hidden; }
+.user-catalog .catalog-run, .user-catalog .catalog-x {
+  border:0;
+  background:transparent;
+  color:inherit;
+  font:inherit;
+  font-weight:inherit;
+  cursor:pointer;
+}
+.user-catalog .catalog-run { padding:6px 4px 6px 11px; }
+.user-catalog .catalog-x { padding:6px 10px 6px 4px; color:var(--muted-2); font-size:14px; line-height:1; }
+.user-catalog .catalog-x:hover { color:var(--danger); }
+.guest-note {
+  margin-top:14px;
+  padding:9px 13px;
+  border:1px dashed var(--line-strong);
+  border-radius:var(--radius-sm);
+  background:var(--surface-2);
+  color:var(--muted);
+  font-size:12.5px;
+}
+.counts-line { font-variant-numeric:tabular-nums; }
+.discover-card {
+  display:flex;
+  gap:12px;
+  align-items:flex-start;
+  padding:14px 16px;
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  animation:rise .35s ease both;
+  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.discover-card:hover { transform:translateY(-2px); box-shadow:var(--shadow); border-color:var(--line-strong); }
+.discover-card.picked { border-color:var(--accent); box-shadow:0 0 0 3px var(--focus); }
+.discover-check {
+  width:18px;
+  height:18px;
+  min-height:18px;
+  margin-top:4px;
+  flex:none;
+  padding:0;
+  accent-color:var(--accent);
+  cursor:pointer;
+}
+.discover-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:6px; }
+.discover-title { color:var(--ink); font-weight:700; text-decoration:none; overflow-wrap:anywhere; }
+.discover-title:hover { color:var(--accent); }
+.discover-meta { color:var(--muted); font-size:12.5px; overflow-wrap:anywhere; }
+.discover-badges { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.cite-badge, .oa-badge, .discover-id {
+  font-size:10.5px;
+  font-weight:700;
+  letter-spacing:.04em;
+  padding:2px 9px;
+  border-radius:999px;
+  background:var(--surface-3);
+  color:var(--muted);
+}
+.cite-badge { color:var(--accent-strong); background:var(--accent-soft); font-variant-numeric:tabular-nums; }
+.oa-badge { color:var(--success, var(--accent-strong)); background:var(--success-soft, var(--accent-soft)); text-decoration:none; }
+a.oa-badge:hover { text-decoration:underline; }
+.discover-id { font-family:var(--font-mono); overflow-wrap:anywhere; }
+.discover-abstract { margin:0; color:var(--muted); font-size:13px; line-height:1.55; overflow-wrap:anywhere; }
+.discover-more {
+  border:0;
+  background:transparent;
+  color:var(--accent);
+  font:inherit;
+  font-size:12.5px;
+  font-weight:700;
+  cursor:pointer;
+  padding:0;
+  margin-left:6px;
+}
+.discover-more:hover { text-decoration:underline; }
+.discover-actions { display:flex; flex-direction:column; gap:6px; align-items:stretch; flex:none; }
+.discover-actions .ghost-btn, .discover-actions .save-btn { justify-content:center; }
+.discover-actions .save-btn { align-self:center; }
+.collect-wrap { position:relative; display:inline-flex; justify-content:center; }
+.collect-pop {
+  position:absolute;
+  top:calc(100% + 6px);
+  right:0;
+  z-index:30;
+  min-width:230px;
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  padding:10px;
+  background:var(--surface);
+  border:1px solid var(--line-strong);
+  border-radius:var(--radius-sm);
+  box-shadow:var(--shadow);
+  animation:popIn .18s ease both;
+}
+.collect-pop.up { top:auto; bottom:calc(100% + 6px); right:auto; left:0; }
+.collect-opt {
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  gap:10px;
+  width:100%;
+  border:0;
+  background:transparent;
+  color:var(--ink);
+  font:inherit;
+  font-size:13px;
+  text-align:left;
+  padding:7px 9px;
+  border-radius:8px;
+  cursor:pointer;
+}
+.collect-opt:hover { background:var(--accent-soft); color:var(--accent-strong); }
+.collect-count { color:var(--muted-2); font-size:11px; font-variant-numeric:tabular-nums; flex:none; }
+.collect-empty { padding:4px 9px; color:var(--muted); font-size:12.5px; }
+.collect-new { display:flex; gap:6px; margin-top:4px; padding-top:8px; border-top:1px solid var(--line); }
+.collect-new input { min-height:34px; font-size:13px; }
+.collect-new .ghost-btn { flex:none; padding:4px 12px; }
+.batch-bar {
+  position:sticky;
+  bottom:14px;
+  z-index:20;
+  margin-top:14px;
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:12px;
+  padding:10px 16px;
+  background:var(--surface);
+  border:1px solid var(--accent);
+  border-radius:999px;
+  box-shadow:var(--shadow);
+  animation:rise .25s ease both;
+}
+.batch-count { font-weight:700; color:var(--ink); font-size:13px; font-variant-numeric:tabular-nums; }
+@media (max-width:640px) {
+  .discover-card { flex-wrap:wrap; }
+  .discover-actions { flex-direction:row; flex-wrap:wrap; width:100%; justify-content:flex-end; }
+  .discover-rail .fld { max-width:none; }
+  .collect-pop { right:auto; left:0; }
+}
+
+/* ── Reader workspace (split-screen paper chat) ──
+   Appended after the AI-native reskin so colors come only from the custom
+   properties and both themes just work. The citation flash is a keyframe on
+   accent tokens; it collapses under the reduced-motion override below. */
+.reader-shell {
+  max-width:1560px;
+  height:calc(100vh - 40px);
+}
+.reader-head { padding:14px 20px; }
+.reader-head .chat-title { margin:4px 0 2px; }
+.reader-byline {
+  margin:2px 0 6px;
+  color:var(--muted);
+  font-size:12.5px;
+  overflow-wrap:anywhere;
+}
+.reader-actions { flex-wrap:wrap; justify-content:flex-end; }
+a.reader-ext {
+  display:inline-flex;
+  align-items:center;
+  text-decoration:none;
+}
+a.reader-ext:hover { border-color:var(--accent); color:var(--accent); }
+.reader-panes {
+  flex:1;
+  display:flex;
+  min-height:0;
+}
+.reader-panes.swap { flex-direction:row-reverse; }
+.reader-pane {
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+  min-height:0;
+}
+.reader-pane.doc { flex-grow:0; flex-shrink:0; }
+.reader-pane.chat { flex:1; }
+.reader-panes.max-doc .reader-pane.doc { flex:1 1 auto !important; }
+.reader-panes.max-doc .reader-pane.chat,
+.reader-panes.max-doc .reader-divider,
+.reader-panes.max-chat .reader-pane.doc,
+.reader-panes.max-chat .reader-divider { display:none; }
+.reader-divider {
+  flex:none;
+  width:12px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:col-resize;
+  touch-action:none;
+  border-left:1px solid var(--line);
+  border-right:1px solid var(--line);
+  background:var(--surface-2);
+}
+.reader-divider span {
+  width:3px;
+  height:44px;
+  border-radius:999px;
+  background:var(--line-strong);
+}
+.reader-divider:hover span, .reader-divider:active span { background:var(--accent); }
+.reader-pane-bar {
+  flex:none;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:8px 14px;
+  border-bottom:1px solid var(--line);
+  background:var(--surface-2);
+}
+.reader-pane-label {
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  color:var(--muted);
+}
+.reader-tabs { display:flex; gap:6px; }
+.reader-tab {
+  padding:5px 12px;
+  border:1px solid var(--line);
+  border-radius:999px;
+  background:var(--surface);
+  color:var(--muted);
+  font-size:12px;
+  font-weight:800;
+  cursor:pointer;
+}
+.reader-tab:hover { border-color:var(--accent); color:var(--accent); }
+.reader-tab.on {
+  border-color:var(--accent);
+  background:var(--accent-soft);
+  color:var(--accent-strong);
+}
+.reader-max {
+  width:30px;
+  min-width:30px;
+  height:30px;
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  background:var(--surface);
+  color:var(--muted);
+  font-size:13px;
+  line-height:1;
+  cursor:pointer;
+}
+.reader-max:hover { border-color:var(--accent); color:var(--accent); }
+.reader-doc-view { display:none; flex:1; min-height:0; flex-direction:column; }
+.reader-doc-view.on { display:flex; }
+.reader-doc-scroll {
+  flex:1;
+  overflow-y:auto;
+  padding:18px 22px 28px;
+}
+.reader-doc-note { margin-bottom:14px; }
+.reader-doc-note a { color:var(--accent-strong); font-weight:700; }
+.reader-section { margin:0 0 18px; }
+.reader-section-title {
+  margin:0 0 8px;
+  font-size:13px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  color:var(--accent-strong);
+}
+.reader-chunk {
+  margin:0 0 10px;
+  padding:2px 6px;
+  border-radius:var(--radius-sm);
+  font-size:13.5px;
+  line-height:1.65;
+  color:var(--ink);
+  white-space:pre-line;
+  overflow-wrap:anywhere;
+  scroll-margin:60px;
+}
+@keyframes citeFlash {
+  0%, 70% { background:var(--accent-soft); box-shadow:0 0 0 3px var(--focus); }
+  100% { background:transparent; box-shadow:none; }
+}
+.reader-chunk.flash { animation:citeFlash 1.6s ease both; }
+.reader-skeleton { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+.reader-skeleton span {
+  display:block;
+  height:13px;
+  border-radius:999px;
+  background:var(--surface-3);
+  animation:blink 1.2s infinite ease-in-out;
+}
+.reader-skeleton span:nth-child(2n) { width:92%; }
+.reader-skeleton span:nth-child(3n) { width:78%; }
+.reader-pdf-note {
+  flex:none;
+  padding:8px 14px;
+  border-bottom:1px solid var(--line);
+  background:var(--surface-2);
+  color:var(--muted);
+  font-size:12.5px;
+}
+.reader-pdf-note a { color:var(--accent-strong); font-weight:700; }
+.reader-pdf-frame { flex:1; width:100%; border:0; background:var(--surface); }
+.chat-msg-stack { max-width:80%; min-width:0; display:flex; flex-direction:column; gap:6px; }
+.chat-msg-stack .chat-bubble { max-width:100%; }
+.chat-cite.clickable {
+  cursor:pointer;
+  text-decoration:underline;
+  text-decoration-style:dotted;
+  text-underline-offset:2px;
+}
+.chat-cite.clickable:hover, .chat-cite.clickable:focus-visible {
+  background:var(--accent);
+  color:#fff;
+  outline:none;
+}
+.chat-cite.unverified {
+  background:var(--surface-3);
+  color:var(--muted-2);
+  border:1px dashed var(--line-strong);
+}
+.evidence-row { font-size:12px; }
+.evidence-toggle {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  padding:3px 9px;
+  border:1px solid var(--line);
+  border-radius:999px;
+  background:var(--surface-2);
+  color:var(--muted);
+  font-size:11.5px;
+  font-weight:800;
+  cursor:pointer;
+}
+.evidence-toggle:hover { border-color:var(--accent); color:var(--accent); }
+.evidence-caret { font-size:10px; }
+.evidence-list {
+  margin:8px 0 0;
+  padding:10px 12px;
+  list-style:none;
+  display:flex;
+  flex-direction:column;
+  gap:9px;
+  border:1px solid var(--line);
+  border-radius:var(--radius-sm);
+  background:var(--surface-2);
+  animation:popIn .18s ease both;
+}
+.evidence-item { display:flex; gap:8px; align-items:flex-start; }
+.evidence-item .chat-cite { flex:none; margin-top:1px; }
+.evidence-snippet { color:var(--muted); font-size:12px; line-height:1.55; overflow-wrap:anywhere; }
+.evidence-section { color:var(--ink); font-weight:700; }
+@media (max-width:900px) {
+  .reader-overlay { padding:0; }
+  .reader-shell {
+    height:100vh;
+    max-width:none;
+    border:0;
+    border-radius:0;
+  }
+  .reader-panes, .reader-panes.swap { flex-direction:column; }
+  .reader-divider { display:none; }
+  .reader-pane.doc {
+    flex:0 0 46% !important; /* overrides the inline split basis */
+    border-bottom:1px solid var(--line);
+  }
+  .reader-panes.max-doc .reader-pane.doc { flex:1 1 auto !important; border-bottom:0; }
+  .reader-doc-scroll { padding:14px 16px 22px; }
+}
+
+/* ── Knowledge mode ──
+   Appended after the AI-native reskin so colors come only from the custom
+   properties and both themes just work. Entrances reuse the rise/popIn
+   keyframes with inline animationDelay staggers; everything collapses under
+   the reduced-motion override below. */
+.knowledge-panel.running::after {
+  content:"";
+  display:block;
+  height:3px;
+  margin-top:14px;
+  border-radius:999px;
+  background:linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size:200% 100%;
+  animation:sweep 1.1s linear infinite;
+}
+.collection-new {
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  align-items:center;
+  margin-top:14px;
+}
+.collection-new .custom-in { flex:1 1 240px; max-width:380px; }
+.collection-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));
+  gap:12px;
+  margin-top:16px;
+}
+.collection-card {
+  position:relative;
+  display:flex;
+  flex-direction:column;
+  gap:9px;
+  padding:13px 14px;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  animation:rise .35s ease both;
+  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.collection-card:hover { transform:translateY(-2px); border-color:var(--line-strong); box-shadow:var(--shadow); }
+.collection-card.on { border-color:var(--accent); box-shadow:0 0 0 3px var(--focus); }
+.collection-pick {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:4px;
+  border:0;
+  padding:0;
+  background:transparent;
+  font:inherit;
+  text-align:left;
+  cursor:pointer;
+}
+.collection-name { font-weight:750; color:var(--ink); overflow-wrap:anywhere; padding-right:64px; }
+.collection-pick:hover .collection-name { color:var(--accent); }
+.collection-meta { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+.analyzed-badge {
+  position:absolute;
+  top:11px;
+  right:11px;
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:.05em;
+  text-transform:uppercase;
+  padding:2px 8px;
+  border-radius:999px;
+  background:var(--accent-soft);
+  color:var(--accent-strong);
+  animation:popIn .2s ease both;
+}
+.collection-tools { display:flex; gap:6px; }
+.collection-tools .ghost-btn { padding:3px 10px; font-size:11.5px; }
+.collection-rename { display:flex; gap:6px; align-items:center; }
+.collection-rename .custom-in { min-height:34px; font-size:13px; flex:1; min-width:0; }
+.collection-rename .ghost-btn { flex:none; }
+.collection-empty {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:8px;
+  padding:18px;
+  border:1px dashed var(--line-strong);
+  border-radius:var(--radius);
+  background:var(--surface-2);
+  animation:popIn .2s ease both;
+}
+.collection-empty strong { color:var(--ink); }
+.collection-paper .paper-chip { flex:none; }
+.knowledge-pointer {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:12px 16px;
+  border:1px dashed var(--line-strong);
+  border-radius:var(--radius);
+  background:var(--surface-2);
+  color:var(--muted);
+  font-size:13px;
+  animation:rise .3s ease both;
+}
+@media (max-width:640px) {
+  .collection-grid { grid-template-columns:1fr; }
+  .collection-new .custom-in { max-width:none; }
+}
+
+/* ── Mobile reachability fixes ──
+   Appended after the AI-native reskin so colors come only from the custom
+   properties and both themes just work. overflow-x:hidden made html, body,
+   #root, and .app each a scroll container, which silently disabled the batch
+   bar's position:sticky and let programmatic focus pan the clipped page
+   sideways; clip crops the same overflow without creating a scroll
+   container, so the bar sticks to the real viewport and the page can never
+   be panned off-screen. */
+html, body, #root, .app { overflow-x:clip; }
+.batch-bar { bottom:calc(14px + env(safe-area-inset-bottom, 0px)); }
+@media (max-width:720px) {
+  /* The 7-tab mode switch outgrows small phones: scroll the strip itself
+     (hidden scrollbar, touch momentum) so .app never gains horizontal
+     overflow and every tab stays reachable by swipe. */
+  .mast-right, .mast-tools { min-width:0; max-width:100%; }
+  .mode-switch {
+    /* own full-width row: overflow:auto zeroes the automatic min-width, so
+       the earlier flex:1 (basis 0%) would otherwise squeeze the strip onto a
+       shared line instead of wrapping it like the content width used to */
+    flex:1 1 100%;
+    max-width:100%;
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    overscroll-behavior-x:contain;
+    -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;
+  }
+  .mode-switch::-webkit-scrollbar { display:none; }
+  .mode-tab { white-space:nowrap; }
 }
 
 /* respect reduced-motion (motion/react is covered by MotionConfig) */

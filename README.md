@@ -8,11 +8,24 @@ them, and generates a structured briefing for each: TL;DR, key points, method,
 results, impact score, and tags. Open any paper's chat to ask questions answered
 from its full text, with citations.
 
+**Discover** mode runs filtered literature searches across arXiv + Semantic
+Scholar + OpenAlex: date-range chips, sort, author / venue / arXiv-category
+filters, an open-access toggle, curated and user-saved research catalogs,
+saved searches, and multi-select into paper collections. Every result can be
+read and chatted with, bookmarked, or collected.
+
 Or switch to **Research** mode: a [LangGraph](https://langchain-ai.github.io/langgraphjs/)
 agent plans arXiv queries for a topic, keeps only the papers it judges relevant,
 extracts their key ideas, regroups those ideas into cross-paper themes (where the
 papers agree and where they contradict), and writes a cited synthesis report.
-Each run is saved as a knowledge base you can chat with.
+Each run is saved into the knowledge base.
+
+**Knowledge** mode is where everything you keep lives: curated paper
+collections (create / rename / delete, papers collected from Discover and the
+reader), a one-click **Analyze** that maps themes and concepts, compares the
+papers side by side, and writes a cited brief; chat scoped to a collection;
+a per-collection full-text retrieval index; plus the library and the saved
+research runs you chat across.
 
 Then move to **Studio** mode: pull the extracted ideas onto an idea board,
 regroup them into your own groups (drag cards between them, add your own
@@ -85,13 +98,18 @@ Override the port with `make run PORT=3000`.
 | **Tag filter** | Click any generated tag to filter the digest |
 | **Subject finder** | Re-ranks loaded papers in real time without a new API call |
 | **Free-text filter** | Across title, authors, abstract, TL;DR, method, results, tags |
-| **Paper chat** | RAG-style chat grounded in full paper text, evidence cited with `[E1]` ids |
+| **Paper reader & chat** | A split-screen reader per paper: sectioned full text (or the arXiv PDF) beside a RAG-style chat with a draggable divider, swap-sides and per-pane maximize (prefs in `pb_reader`). Each answer stores an evidence snapshot, so `[E#]` citations are clickable chips that jump to and flash the exact source chunk — re-verified against today's text first, since chunk ids are positional and a later load can chunk differently (a moved snippet is re-located; an unlocatable one never flashes unrelated text); ids without a snapshot entry are mechanically marked unverified and never clickable |
+| **Discover mode** | Filtered multi-source search (`action: "discover"`): arXiv + Semantic Scholar + OpenAlex merged and deduped, with date-range chips (24h → year → custom), sort (relevance / newest / most cited), open-access toggle, author / venue / arXiv-category filters, and per-source result counts — a failing or rate-limited provider shows as `0`, never silently. An author filter is enforced natively per provider (arXiv `au:`, OpenAlex `raw_author_name.search`); the post-filter only drops papers that *provably* violate a filter — unknown venues, dates, OA status, and author lists truncated to "… et al." pass through. Guests get a client-side arXiv-only fallback, with the venue / citation-sort / open-access controls (which need the other sources) disabled and annotated |
+| **Research catalogs & saved searches** | Curated one-click catalogs (LLM Inference Optimization, RAG, Agentic AI, …) plus your own catalogs (`pb_catalogs`) and saved searches with last-run tracking (`pb_searches`), each capped at 20 |
+| **Collections** | Collect Discover results (per card, or multi-select with a sticky batch bar) into named collections stored under `pb_knowledge.collections` — up to 12 collections of 50 papers, deduped by paper key |
+| **Knowledge mode** | The collections workspace: create / rename / delete collections, review their papers (open, Read & Chat, remove), and **Analyze** a collection via the streaming `collection` action — cross-paper themes, key concepts, a side-by-side comparison (exportable as CSV), and a cited brief, all persisted on the collection with partial salvage on failure; plus the interactive knowledge graph and papers-by-year chart per collection |
+| **Chat with a collection** | Knowledge chat scoped to a collection: its papers ride along as `knowledge.collections`, and **Build index** fetches each paper's full text (server ingest first, CORS-proxy fallback) into the browser vector store (`col:<collection>:<paper>` docs) with per-paper progress and failure logging, so retrieval cites collection evidence |
 | **Research agent** | LangGraph agent: query planning → relevance grading (with iterative query refinement) → idea extraction → cross-paper theme regrouping → parallel understand / challenge / practice / compare analyses → cited synthesis report with a self-review + revision pass, streamed live |
-| **Knowledge base** | Research runs saved in `localStorage` (`pb_knowledge`); select runs and chat across them — the agent can also search arXiv and read papers mid-answer |
+| **Knowledge base** | Research runs saved in `localStorage` (`pb_knowledge`), managed in the Knowledge mode: select runs and chat across them — the agent can also search arXiv and read papers mid-answer — **View** any saved run (its report, themes, graph, and tables reopen in Research), export it as Markdown, and Research links straight there after each run saves |
 | **Paper figures** | The agent scrapes each kept paper's HTML render for its first figures (image + caption) and shows them on the paper rows |
 | **Knowledge graph** | An interactive papers ↔ themes ↔ concepts graph per run: hover traces connections, click a paper to chat with it; plus a papers-by-year chart (categorical colors CVD-validated for both themes) |
 | **RAG / semantic search** | Research runs and library sources are chunked, embedded, and stored in a browser-side vector index; each knowledge-chat question retrieves the best excerpts as cited `[E#]` evidence |
-| **Library** | Add sources beyond research runs — an arXiv id, any public article URL (fetched and cleaned server-side), or pasted text — and they join the retrieval index |
+| **Library** | In the Knowledge mode: add sources beyond research runs — an arXiv id, any public article URL (fetched and cleaned server-side), or pasted text — and they join the retrieval index |
 | **Embedding platforms** | Choose in Settings: off (lexical only), a local in-browser model (`all-MiniLM-L6-v2` via transformers.js, ~25MB one-time download, fully private), or any OpenAI-compatible embeddings API (OpenAI, Jina, Mistral, Ollama, ...) |
 | **Partial salvage** | Sections stream in as they finish; a failed or stopped run can be saved as a (marked) partial knowledge run |
 | **Follow-up research** | Every open question the critic raises has a "Research this →" button that seeds a new agent run |
@@ -101,7 +119,7 @@ Override the port with `make run PORT=3000`.
 | **Article drafting** | A LangGraph pipeline (outline → draft each section → polish) writes a full article from your board, grounded in your grouping, with `[n]` citations into a numbered source list; audience / tone / length controls and an optional hand-written outline |
 | **Article export** | Drafts stream in live, are kept in the browser (`pb_articles`), and export as Markdown with the source list appended |
 | **Command center (Home)** | The default landing view: a research launchpad that prefills any mode, animated metric tiles computed from stored data, a recent-activity timeline of real artifacts, and the **research universe** — a dependency-free interactive 3D canvas (rotate / zoom / pan / click) of every run, investigation, paper, theme, concept, hypothesis, and article |
-| **Command palette** | Ctrl/Cmd+K anywhere: navigate modes, toggle theme, open saved runs/labs/articles, or type a question and launch it straight into the Lab or Research |
+| **Command palette** | Ctrl/Cmd+K anywhere: navigate modes, toggle theme, open saved runs/labs/articles/collections (a run reopens in Research, a collection opens preselected in Knowledge), or type a question and launch it straight into the Lab or Research |
 | **The Lab** | A nine-agent investigation per objective: Director plans, Scout searches arXiv + Semantic Scholar + OpenAlex (merged, deduped, graded), Analyst extracts claims whose quotes are **mechanically verified** against fetched text, Ideator generates hypotheses with real novelty probes, Skeptic/Proponent/Arbiter debate (disagreements recorded, no forced consensus), Methodologist designs experiment protocols, Writer reports with provenance stats |
 | **Agent activity monitor** | Live pipeline view + a feed of agent and tool events — which agent is working, which tool it called, what it found |
 | **Authentication gate** | A full-page sign-in shown once per tab session: verify your own OpenRouter key (live against `/api/v1/key`) or a private deployment's access token (against `/api/agent`), or continue as guest — credentials stay in tab memory only, exactly like Settings |
@@ -131,7 +149,7 @@ api/
     text.js             #   pure text/scoring helpers ported from App.jsx
 tests/                  # node:test suite (npm test)
 src/
-  App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~5.7k lines)
+  App.jsx               # ★ the entire app: fetching, ranking, UI, chat (~8.5k lines)
   main.jsx              # React entry point
 public/                 # favicon.svg, PWA icons, site.webmanifest
 arxiv-batch-analyzer.jsx  # legacy 3-line re-export shim → src/App.jsx
@@ -141,7 +159,7 @@ vercel.json             # build config + serverless function + SPA rewrite
 ```
 
 `src/App.jsx` is a deliberate single-file app — data fetching, ranking, every
-component, and the chat system live in one ~5,700-line module. Know that before
+component, and the chat system live in one ~8,500-line module. Know that before
 planning a change. The root `arxiv-batch-analyzer.jsx` is a compatibility shim
 for older imports and nothing references it.
 
@@ -197,8 +215,11 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   idea extraction.
 - **Chat** (`{action: "chat", messages, knowledge}`): a tool-loop agent with
   `consult_knowledge` (lexical search over the knowledge payload the browser
-  sends), `search_arxiv`, and `read_paper`. Knowledge lives only in the
-  browser (`pb_knowledge`); the server holds no state.
+  sends), `search_arxiv`, and `read_paper`. The payload may also include
+  `knowledge.collections` (curated paper collections): their names and paper
+  titles join the digest and their papers are searchable, with hits tagged by
+  collection. Knowledge lives only in the browser (`pb_knowledge`); the
+  server holds no state.
 
 - **Ingest** (`{action: "ingest", url}`): fetches one source for the library —
   an arXiv id via the paper pipeline, or a public article URL stripped to
@@ -216,6 +237,28 @@ plan_queries → search_arxiv → grade_relevance ──┬→ extract_ideas →
   polish_article` (smooths transitions; on failure the stitched draft is kept).
   Citations outside the source list are stripped mechanically. Hard caps: ≤40
   sources, ≤80 cards, ≤8 sections — ≤10 LLM calls per draft.
+
+- **Discover** (`{action: "discover", query, filters}`): one filtered
+  literature search across arXiv + Semantic Scholar + OpenAlex — plain JSON,
+  no SSE, no LLM call. Optional filters: `from`/`to` (`YYYY-MM-DD`), `sort`
+  (`relevance` | `newest` | `citations`), `openAccess`, `author`, `venue`,
+  `category` (arXiv taxonomy, e.g. `cs.CL`), `perSource` (1–25). Filters map
+  to native provider params where supported and a mechanical post-filter
+  enforces them uniformly on the merged pool; invalid filter fields are
+  dropped, not errors. Returns `{papers, counts, filters}` with per-source
+  result counts and the normalized filters. Papers now also carry `venue`,
+  `isOpenAccess`, and `pdfUrl` where the sources know them.
+
+- **Collection** (`{action: "collection", name, papers}`): analyze a curated
+  collection of 2–16 papers (title required; abstract/authors/venue/date
+  optional) with a linear LangGraph pipeline: themes + key concepts → a
+  per-paper comparison matrix → an executive brief with `[n]` citations into
+  the collection (out-of-range citations stripped mechanically, unknown paper
+  ids dropped by the normalizers). Streams the usual SSE frames and a final
+  `result.analysis`; ≤3 LLM calls per run, every stage degrades gracefully.
+  The Knowledge mode drives it: Analyze sends the collection's first 16
+  papers, stores the analysis back on the collection (brief clipped to 20k
+  chars), and salvages streamed partials when a run fails or is stopped.
 
 - **Lab** (`{action: "lab", objective}`): the multi-agent investigation
   (see `docs/PLATFORM.md`). Literature comes from three real APIs
@@ -244,7 +287,8 @@ The knowledge base lives in the browser, so the vector index does too:
    falls back to lexical search everywhere.
 3. **Retrieve**: before each knowledge-chat message the client embeds the
    question, cosine-searches the chunks of the selected runs + all library
-   sources, and sends the top excerpts with the request.
+   sources (+ the collection's indexed papers when the chat was opened from a
+   collection), and sends the top excerpts with the request.
 4. **Ground**: the server agent receives them as `[E#]` evidence blocks in
    its system prompt and cites them; the `consult_knowledge` tool still
    covers the structured knowledge (and un-indexed sources lexically), and
@@ -252,18 +296,26 @@ The knowledge base lives in the browser, so the vector index does too:
 
 ### How paper chat works
 
-1. Fetch the full HTML render from `arxiv.org/html/{id}`, falling back to
-   `ar5iv`, via CORS proxies (direct → `corsproxy.io` → `api.allorigins.win`).
-   If all fail, chat degrades to the abstract plus the generated briefing.
+1. Fetch the full text: with a credential, the server ingest runs first
+   (`action: "ingest"`, SSRF-guarded); otherwise — or if it fails — fetch the
+   HTML render from `arxiv.org/html/{id}`, falling back to `ar5iv`, via CORS
+   proxies (direct → `corsproxy.io` → `api.allorigins.win`). If all fail, the
+   reader shows the abstract and chat degrades to abstract + briefing summary.
 2. Split the text into structured sections (Abstract, Introduction, Method,
-   Results, …) then into overlapping ~1,700-character chunks.
+   Results, …) then into overlapping ~1,700-character chunks. The reader's
+   Text tab renders these same chunks, each anchored by its chunk id.
 3. For each message, select the top 7 chunks by a BM25-style token score with
    intent boosting — a question about "limitations" boosts limitation and
    discussion sections.
 4. Send those chunks plus up to 12 recent turns to the LLM, with a system prompt
    requiring `[E1]`-style evidence citations and an explicit "the evidence
    doesn't support this" escape hatch.
-5. Persist chat history per paper in `localStorage`.
+5. Store an evidence snapshot (id, chunk id, section, 300-char snippet) with
+   each answer — selected mechanically *before* the LLM ran, so citations are
+   verified by construction. In the reader, a cited `[E#]` is a clickable chip
+   that scrolls to and flashes its source chunk; an id with no snapshot entry
+   renders as "unverified citation" and is never clickable.
+6. Persist chat history (with evidence snapshots) per paper in `localStorage`.
 
 ### Ranking
 
@@ -291,14 +343,18 @@ simply contributes zero results — the Lab merges whatever responds.
 
 ### localStorage keys
 
-`openrouter_model` · `pb_theme` (dark is the default) · `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` · `pb_knowledge`
-(saved research runs, lab investigations, library sources, knowledge chat) · `pb_studio` (the idea
+`openrouter_model` · `pb_theme` (dark is the default) · `pb_cache` (last digest) · `pb_bookmarks` · `pb_paper_chats` (per-paper history incl. evidence snapshots) · `pb_reader` (reader layout: pane split, side, document tab) · `pb_knowledge`
+(saved research runs, lab investigations, library sources, knowledge chat,
+paper collections) · `pb_catalogs` (saved Discover catalogs) · `pb_searches`
+(saved Discover searches) · `pb_studio` (the idea
 board) · `pb_articles` (drafted articles) · `pb_emb_provider` /
 `pb_emb_url` / `pb_emb_model` (embeddings platform; the key itself is never
 stored). The vector index lives in IndexedDB as `pb_rag`, and
 `sessionStorage.pb_auth_entered` remembers that the auth gate was passed this
 tab session (never the credential itself). Clear them in DevTools →
-Application for a clean state.
+Application for a clean state. When the browser's quota is exhausted a write
+fails loudly — a toast warns that the last change was **not** saved instead of
+silently dropping it.
 
 ## Deploy on Vercel
 
